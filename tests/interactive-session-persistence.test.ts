@@ -35,6 +35,20 @@ test("persists session revisions and rejects stale compare-and-set saves", async
   await expect(store.save(stale, 0)).rejects.toMatchObject({ code: "SESSION_REVISION_CONFLICT" })
 })
 
+test("persists the append-only execution ledger and migrates old sessions with an empty ledger", async () => {
+  const { dataRoot, store, record } = await fixture()
+  expect(record.execution_ledger.map((entry) => entry.agent)).toEqual([
+    "background-collector",
+    "self-assessor",
+    "objective-diagnostician",
+  ])
+  const path = join(dataRoot, "sessions", `${record.session_id}.json`)
+  const legacy = JSON.parse(await readFile(path, "utf8"))
+  delete legacy.execution_ledger
+  await writeFile(path, JSON.stringify(legacy))
+  expect((await store.load(record.session_id)).execution_ledger).toEqual([])
+})
+
 test("heartbeats a live lock so another process cannot steal it as stale", async () => {
   const { dataRoot, store } = await fixture()
   const other = new InteractiveSessionStore(dataRoot)

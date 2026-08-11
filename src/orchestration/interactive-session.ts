@@ -33,6 +33,7 @@ import { RoleBLearningProgressAdapter } from "../role-b-profile/teaching-audit/l
 import { createLocalBPathPlanningPort } from "../role-c-content/review/local-b-path-planning-port"
 import type { KnowledgeBase } from "../knowledge/types"
 import type { LearnerProfileSnapshot } from "../role-c-content/contracts/profile-adapter"
+import { appendAgentExecution, summarizeAgentCollaboration, type PublicAgentCollaborationMetrics, type PublicAgentExecutionRecord } from "./agent-execution-ledger"
 
 export type InteractiveSessionStatus = "waiting_for_user" | "running" | "completed" | "blocked" | "failed"
 export type InteractiveStage = "objective_diagnosis" | "assessment" | "completed" | "blocked" | "failed"
@@ -82,6 +83,8 @@ export interface InteractiveSessionRecord {
     items: unknown[]
   }
   worker_ledger: PublicWorkerLedgerEntry[]
+  /** Append-only、脱敏的真实执行历史；worker_ledger 继续作为当前状态快照。 */
+  execution_ledger: PublicAgentExecutionRecord[]
   profile: unknown | null
   formal_path: unknown | null
   current_path_node: unknown | null
@@ -126,6 +129,7 @@ export interface InteractiveSessionRecord {
 
 export type InteractiveSessionPublicView = Omit<InteractiveSessionRecord, "revision" | "private" | "processed_commands" | "learner_request" | "owner_id" | "events"> & {
   events?: never
+  collaboration_metrics: PublicAgentCollaborationMetrics
 }
 
 export interface CreateInteractiveSessionInput {
@@ -223,6 +227,7 @@ export class InteractiveSessionStore {
         { worker: "self-assessor", status: "completed", summary: "已收集学习者自评", updated_at: now },
         { worker: "objective-diagnostician", status: "waiting_for_user", summary: "等待诊断作答", updated_at: now },
       ],
+      execution_ledger: [],
       profile: null,
       formal_path: null,
       current_path_node: null,
@@ -239,6 +244,15 @@ export class InteractiveSessionStore {
       created_at: now,
       updated_at: now,
     }
+    appendAgentExecution(record, executionRecord("background-collector", "deterministic_adapter", "completed", "已收集学习背景", {
+      callId: `${sessionId}-R1-background-collector`, outputRefs: ["background-evidence"], timestamp: now,
+    }))
+    appendAgentExecution(record, executionRecord("self-assessor", "deterministic_adapter", "completed", "已收集学习者自评", {
+      callId: `${sessionId}-R1-self-assessor`, outputRefs: ["self-assessment-evidence"], timestamp: now,
+    }))
+    appendAgentExecution(record, executionRecord("objective-diagnostician", "deterministic_adapter", "waiting_for_user", "等待诊断作答", {
+      callId: `${sessionId}-R1-objective-diagnostician`, inputRefs: ["knowledge-base", "learner-memory"], outputRefs: ["diagnosis-items"], timestamp: now,
+    }))
     await this.save(record, null)
     return record
   }
@@ -343,8 +357,15 @@ export class InteractiveSessionStore {
       const code = command.payload?.code
       const roleC = record.private.role_c
       if (!roleC || !itemId || !code) throw new InteractiveSessionError("INVALID_COMMAND", "run_assessment_code requires item_id and code", 400)
-      const result = await runRoleCAssessmentCode({ executionId: `EXEC-${record.session_id}-${command.command_id}`, sessionId: roleC.session_id, runId: roleC.run_id, learnerId: roleC.learner_id, itemId, code }, roleCRuntime(this.data_root))
+      const executionId = `EXEC-${record.session_id}-${command.command_id}`
+      appendAgentExecution(record, executionRecord("role-c-code-runner", "external_port", "invoked", "trusted assessment code execution requested", {
+        callId: executionId, stage: "assessment", inputRefs: [`assessment-item:${itemId}`, "learner-code-submission"],
+      }))
+      const result = await runRoleCAssessmentCode({ executionId, sessionId: roleC.session_id, runId: roleC.run_id, learnerId: roleC.learner_id, itemId, code }, roleCRuntime(this.data_root))
       record.code_execution = result
+      appendAgentExecution(record, executionRecord("role-c-code-runner", "external_port", "completed", "trusted assessment code execution completed", {
+        callId: executionId, stage: "assessment", inputRefs: [`assessment-item:${itemId}`], outputRefs: ["code-execution:public-summary"],
+      }))
       record.updated_at = new Date().toISOString()
       updated = record
     } else if (command.type === "submit_assessment_answers") {
@@ -376,6 +397,10 @@ export class InteractiveSessionStore {
         record.blocked_reason = null
         record.private.role_c_generation_attempt = (record.private.role_c_generation_attempt ?? 0) + 1
         record.updated_at = new Date().toISOString()
+        appendAgentExecution(record, executionRecord("learning-orchestrator", "orchestrator_decision", "completed", "resumed persisted next-round generation", {
+          callId: `${record.session_id}-R${record.round_no}-retry-${command.command_id}`,
+          stage: "assessment", inputRefs: ["next-round-context", "retry-command"], outputRefs: ["role-c-generation-resume"],
+        }))
         record.events.push(event(record.session_id, "session_updated", "assessment", `round ${record.round_no} generation resumed from persisted feedback`, record.updated_at, "tiered-evaluator"))
         const response = publicSessionView(record)
         record.processed_commands[command.command_id] = { request_hash: requestHash, response }
@@ -659,6 +684,7 @@ function normalizeSessionRecord(record: InteractiveSessionRecord): InteractiveSe
     revision: Number.isSafeInteger(record.revision) && record.revision >= 0 ? record.revision : 0,
     code_execution: record.code_execution ?? null,
     adaptation: record.adaptation ?? null,
+    execution_ledger: Array.isArray(record.execution_ledger) ? record.execution_ledger : [],
     private: {
       diagnosis_answer_key: record.private?.diagnosis_answer_key ?? {},
       diagnosis_answers: record.private?.diagnosis_answers ?? null,
@@ -681,7 +707,7 @@ function normalizeSessionRecord(record: InteractiveSessionRecord): InteractiveSe
 
 export function publicSessionView(record: InteractiveSessionRecord): InteractiveSessionPublicView {
   const { private: _private, processed_commands: _processed, learner_request: _request, owner_id: _owner, events: _events, ...view } = structuredClone(record)
-  return view
+  return { ...view, collaboration_metrics: summarizeAgentCollaboration(view.execution_ledger) }
 }
 
 export class InteractiveSessionError extends Error {
@@ -696,6 +722,12 @@ async function retryInteractiveSession(
 ): Promise<InteractiveSessionRecord> {
   const record = structuredClone(original)
   record.blocked_reason = null
+  appendAgentExecution(record, executionRecord("learning-orchestrator", "orchestrator_decision", "completed", "retry routed from persisted session checkpoint", {
+    callId: `${record.session_id}-R${record.round_no}-retry-${record.execution_ledger.length + 1}`,
+    stage: record.current_stage,
+    inputRefs: ["retry-command", "session-checkpoint"],
+    outputRefs: ["retry-route"],
+  }))
   if (feedbackDecisionAction(record.feedback) === "advance") {
     const path = record.formal_path as FormalLearningPath | null
     const node = record.current_path_node as LearningPathNode | null
@@ -816,6 +848,12 @@ async function continueAfterAssessment(
   }
 
   const submissionId = `SUB-${record.session_id}-R${record.round_no}-${command.command_id}`
+  const scoringCallId = `${record.session_id}-R${record.round_no}-grading-${command.command_id}`
+  appendAgentExecution(record, executionRecord("tiered-evaluator", "external_port", "invoked", "formal assessment grading requested", {
+    callId: scoringCallId,
+    stage: "assessment",
+    inputRefs: ["assessment:public-form", "assessment:learner-submission"],
+  }))
   let outcome: Awaited<ReturnType<typeof submitRoleCAssessment>>
   try {
     outcome = await submitRoleCAssessment({
@@ -833,6 +871,9 @@ async function continueAfterAssessment(
     record.status = "blocked"
     record.current_stage = "blocked"
     record.blocked_reason = `评分服务暂时不可用：${error instanceof Error ? error.message : "unknown grading error"}`
+    appendAgentExecution(record, executionRecord("tiered-evaluator", "external_port", "failed", record.blocked_reason, {
+      callId: scoringCallId, stage: "assessment", error: { code: "GRADING_SERVICE_ERROR", message: record.blocked_reason, retryable: true },
+    }))
     record.events.push(event(record.session_id, "session_blocked", "blocked", record.blocked_reason, new Date().toISOString(), "tiered-evaluator"))
     record.updated_at = new Date().toISOString()
     return record
@@ -841,6 +882,9 @@ async function continueAfterAssessment(
     record.status = "blocked"
     record.current_stage = "blocked"
     record.blocked_reason = `${outcome.code}: ${outcome.message}`
+    appendAgentExecution(record, executionRecord("tiered-evaluator", "external_port", "blocked", record.blocked_reason, {
+      callId: scoringCallId, stage: "assessment", error: { code: outcome.code, message: outcome.message, retryable: true },
+    }))
     record.events.push(event(record.session_id, "session_blocked", "blocked", record.blocked_reason, new Date().toISOString(), "tiered-evaluator"))
     record.updated_at = new Date().toISOString()
     return record
@@ -849,6 +893,10 @@ async function continueAfterAssessment(
     record.status = "blocked"
     record.current_stage = "blocked"
     record.blocked_reason = `assessment requires review: ${outcome.unresolved_item_ids.join(",")}`
+    appendAgentExecution(record, executionRecord("tiered-evaluator", "external_port", "blocked", "assessment requires human or policy review", {
+      callId: scoringCallId, stage: "assessment", outputRefs: ["grading:unresolved-items"],
+      error: { code: "GRADING_NEEDS_REVIEW", message: "assessment requires review", retryable: true },
+    }))
     record.events.push(event(record.session_id, "session_blocked", "blocked", record.blocked_reason, new Date().toISOString(), "tiered-evaluator"))
     record.updated_at = new Date().toISOString()
     return record
@@ -864,6 +912,11 @@ async function continueAfterAssessment(
       code_response: answer.code_response ?? null,
     })),
   }
+  appendAgentExecution(record, executionRecord("tiered-evaluator", "external_port", "completed", "formal assessment graded", {
+    callId: scoringCallId,
+    stage: "assessment",
+    outputRefs: ["feedback:public", `artifact:${outcome.feedback.grade_result.artifact_id}`],
+  }))
   // 评分证据写回 learner-memory：跨会话学习记忆必须随真实作答更新，
   // 否则同一 learner 新会话诊断永远读不到历史掌握情况（此前交互流程只读不写）。
   await persistMasteryToLearnerMemory(record, outcome.feedback, dataRoot)
@@ -873,6 +926,7 @@ async function continueAfterAssessment(
   record.events.push(event(record.session_id, "command_received", "assessment", "Role C accepted and graded assessment answers", new Date().toISOString(), "tiered-evaluator"))
   // 画像漂移：不推进路径、不生成下一轮，回到诊断阶段重建学习者画像。
   if (outcome.feedback.final_decision.action === "reprofile") {
+    appendOrchestratorDecision(record, "reprofile", outcome.feedback.final_decision.reason_codes, "diagnosis-restart")
     return resetToDiagnosisPhase(record, dataRoot)
   }
 
@@ -897,6 +951,8 @@ async function continueAfterAssessment(
     updatedProfileSnapshot: path.profile_snapshot,
     decisionAction,
   })
+  appendOrchestratorDecision(record, decisionAction, outcome.feedback.final_decision.reason_codes,
+    advance.pathCompleted || !advance.nextPathNode ? "path-completed" : "next-round-context")
   record.formal_path = advance.path
   if (advance.pathCompleted || !advance.nextPathNode) {
     record.current_path_node = null
@@ -948,10 +1004,19 @@ async function reportProgressToBAfterGrading(
   feedback: DynamicFeedbackResult,
   dataRoot: string,
 ): Promise<void> {
+  const callId = `${record.session_id}-R${record.round_no}-b-progress`
+  appendAgentExecution(record, executionRecord("role-b-learning-progress", "external_port", "invoked", "learning progress delivery requested", {
+    callId, stage: "assessment", inputRefs: ["feedback:public", "mastery-snapshot"],
+  }))
   try {
     const learnerId = record.learner_request.learner_id ?? record.session_id
     const node = record.current_path_node as LearningPathNode | null
-    if (!node) return
+    if (!node) {
+      appendAgentExecution(record, executionRecord("role-b-learning-progress", "external_port", "blocked", "learning progress delivery has no current path node", {
+        callId, stage: "assessment", error: { code: "PATH_NODE_MISSING", message: "current path node is missing", retryable: false },
+      }))
+      return
+    }
     const knowledgeBase = await loadKnowledgeBase()
     const progressPort = new RoleBLearningProgressAdapter({
       knowledgeBase,
@@ -996,13 +1061,25 @@ async function reportProgressToBAfterGrading(
         },
       })
     }
-    if (events.length === 0) return
+    if (events.length === 0) {
+      appendAgentExecution(record, executionRecord("role-b-learning-progress", "external_port", "completed", "no mapped learning evidence required delivery", {
+        callId, stage: "assessment", outputRefs: ["b-progress:no-op"],
+      }))
+      return
+    }
     const { deliverRoleCToB } = await import("../role-c-content/contracts/external-api")
     await deliverRoleCToB(progressPort, events)
+    appendAgentExecution(record, executionRecord("role-b-learning-progress", "external_port", "completed", "learning progress delivered to Role B", {
+      callId, stage: "assessment", outputRefs: ["b-progress:delivery"],
+      artifactRefs: events.map((entry) => `evidence:${entry.event_id}`),
+    }))
   } catch (error) {
     // B 进度投递失败不阻断用户交互：D 侧 learner-memory 已写入，
     // 且下一次生成/评估时可补偿。
     console.warn(`[orchestrator] B 进度投递非致命失败：${error instanceof Error ? error.message : String(error)}`)
+    appendAgentExecution(record, executionRecord("role-b-learning-progress", "external_port", "failed", "Role B progress delivery failed without blocking the learner session", {
+      callId, stage: "assessment", error: { code: "B_PROGRESS_DELIVERY_FAILED", message: error instanceof Error ? error.message : String(error), retryable: true },
+    }))
   }
 }
 
@@ -1017,6 +1094,7 @@ async function persistMasteryToLearnerMemory(
   feedback: DynamicFeedbackResult,
   dataRoot: string,
 ): Promise<void> {
+  const callId = `${record.session_id}-R${record.round_no}-learner-memory`
   const learnerId = record.learner_request.learner_id ?? record.session_id
   const node = record.current_path_node as LearningPathNode | null
   const objectiveToSource = new Map<string, string>()
@@ -1036,9 +1114,16 @@ async function persistMasteryToLearnerMemory(
       }]
     })
   if (events.length === 0) return
+  appendAgentExecution(record, executionRecord("learner-memory", "external_port", "invoked", "mastery persistence requested", {
+    callId, stage: "assessment", inputRefs: ["feedback:mastery-snapshot"],
+  }))
   const memory = await loadLearnerMemory(dataRoot, learnerId)
   const updated = appendPersistenceEvents(memory, events)
   await saveLearnerMemory(dataRoot, updated)
+  appendAgentExecution(record, executionRecord("learner-memory", "external_port", "completed", "mastery evidence persisted", {
+    callId, stage: "assessment", outputRefs: ["learner-memory:mastery-update"],
+    evidenceRefs: events.flatMap((entry) => "source_id" in entry ? [`source:${entry.source_id}`] : []),
+  }))
 }
 
 interface FormalRoleCRound {
@@ -1177,8 +1262,20 @@ async function generateFormalRoleCRound(
   // 也避免 advance 到新节点时因证据缺失而阻塞。
   const ensured = await ensureCurrentNodeEvidence(ragResult, node)
   if (!ensured.ok) {
+    appendAgentExecution(record, executionRecord("role-a-evidence-refresh", "external_port", "blocked", "A evidence refresh could not resolve required sources", {
+      callId: `${record.session_id}-R${record.round_no}-a-evidence-refresh`,
+      inputRefs: node.target_source_ids.map((sourceId) => `source:${sourceId}`),
+      outputRefs: ensured.missingSources.map((sourceId) => `missing-source:${sourceId}`),
+      error: { code: "A_EVIDENCE_MISSING", message: `missing sources: ${ensured.missingSources.join(",")}`, retryable: false },
+    }))
     return { ok: false, reason: `A 证据刷新失败：${ensured.missingSources.join("、")}` }
   }
+  appendAgentExecution(record, executionRecord("role-a-evidence-refresh", "external_port", "completed", "current-node evidence is ready", {
+    callId: `${record.session_id}-R${record.round_no}-a-evidence-refresh`,
+    inputRefs: node.target_source_ids.map((sourceId) => `source:${sourceId}`),
+    outputRefs: ["rag-result:current-node"],
+    evidenceRefs: ensured.ragResult.results.map((item) => `source:${item.source_id ?? item.sourceId}`),
+  }))
   const currentRagResult = filterRagToCurrentNode(ensured.ragResult, node)
   const requiredSources = [...new Set([...node.target_source_ids, ...(node.prerequisite_source_ids ?? [])])]
   const missingSources = requiredSources.filter((sourceId) => !currentRagResult.results.some((item) => (item.source_id ?? item.sourceId) === sourceId))
@@ -1196,6 +1293,14 @@ async function generateFormalRoleCRound(
   let lastReason = ""
   for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt++) {
     const runId = roleCRoundRunId(record.run_id, record.round_no, baseAttempt + attempt)
+    const callId = `${record.session_id}-R${record.round_no}-role-c-pipeline-C${baseAttempt + attempt + 1}`
+    appendAgentExecution(record, executionRecord("role-c-reviewed-pipeline", "reviewed_pipeline", "invoked", "Role C reviewed generation started", {
+      callId,
+      attempt: baseAttempt + attempt + 1,
+      stage: "assessment",
+      inputRefs: ["profile", "formal-path-node", "rag-result", ...(nextRoundContext ? ["next-round-context"] : [])],
+      evidenceRefs: currentRagResult.results.map((item) => `source:${item.source_id ?? item.sourceId}`),
+    }))
     const result = await generateRoleCForRoleDWithRuntime({
       profile: record.profile as LearnerProfile,
       ragResult: currentRagResult,
@@ -1213,6 +1318,15 @@ async function generateFormalRoleCRound(
       if (!result.reviewedRelease) return { ok: false, reason: "Role C ready result omitted reviewed public release" }
       const [conceptLesson, codeLab, assessment] = result.reviewedRelease.artifacts
       record.private.role_c_generation_attempt = baseAttempt + attempt
+      appendAgentExecution(record, executionRecord("role-c-reviewed-pipeline", "reviewed_pipeline", "completed", "Role C reviewed public release is ready", {
+        callId,
+        attempt: baseAttempt + attempt + 1,
+        stage: "assessment",
+        inputRefs: ["profile", "formal-path-node", "rag-result"],
+        outputRefs: ["role-c:reviewed-public-release"],
+        evidenceRefs: ["role-c:review-reports", "role-c:recovery-summary"],
+        artifactRefs: ["role-c:concept-lesson", "role-c:code-lab", "role-c:assessment"],
+      }))
       return {
         ok: true,
         run_id: result.runId,
@@ -1231,6 +1345,14 @@ async function generateFormalRoleCRound(
       }
     }
     lastReason = result.reason ?? `Role C generation failed (attempt ${attempt + 1})`
+    appendAgentExecution(record, executionRecord("role-c-reviewed-pipeline", "reviewed_pipeline", "blocked", lastReason, {
+      callId,
+      attempt: baseAttempt + attempt + 1,
+      stage: "assessment",
+      inputRefs: ["profile", "formal-path-node", "rag-result"],
+      evidenceRefs: ["role-c:review-reports", "role-c:recovery-summary"],
+      error: { code: "ROLE_C_REVIEW_BLOCKED", message: lastReason, retryable: shouldRetryWholeGenerationReason(lastReason) },
+    }))
     console.warn(`[orchestrator] Role C round ${record.round_no} attempt ${attempt + 1}/${MAX_GENERATION_ATTEMPTS} blocked: ${lastReason}`)
     if (!shouldRetryWholeGenerationReason(lastReason)) break
   }
@@ -1594,6 +1716,10 @@ async function continueAfterDiagnosis(
 
   record.private.diagnosis_answers = structuredClone(answers as Record<string, string>)
   for (const step of ORCHESTRATION_WORKER_SEQUENCE.slice(3, 5)) {
+    const callId = `${record.session_id}-R${record.round_no}-${step.worker}`
+    appendAgentExecution(record, executionRecord(step.worker, "deterministic_adapter", "invoked", `invoke ${step.worker}`, {
+      callId, inputRefs,
+    }))
     record.events.push(event(record.session_id, "worker_invoked", stageForWorker(step.worker), `invoke ${step.worker}`, new Date().toISOString(), step.worker))
     const invocation = {
       ...createScaffoldWorkerInvocation({
@@ -1618,12 +1744,19 @@ async function continueAfterDiagnosis(
         ? result.errors[0]?.message ?? result.summary
         : validation.errors[0]?.message ?? "worker contract invalid"
       record.blocked_reason = failureMessage
+      appendAgentExecution(record, executionRecord(step.worker, "deterministic_adapter", record.status === "blocked" ? "blocked" : "failed", failureMessage, {
+        callId, inputRefs, error: { code: validation.ok ? "WORKER_NOT_COMPLETED" : "WORKER_CONTRACT_INVALID", message: failureMessage, retryable: true },
+      }))
       record.events.push(event(record.session_id, "session_blocked", record.current_stage, record.blocked_reason, new Date().toISOString(), step.worker))
       record.updated_at = new Date().toISOString()
       return record
     }
     upstreamArtifacts[step.worker] = result.artifacts
     inputRefs = result.output_refs
+    appendAgentExecution(record, executionRecord(step.worker, "deterministic_adapter", "completed", result.summary, {
+      callId, inputRefs: invocation.input_refs, outputRefs: result.output_refs,
+      artifactRefs: Object.keys(result.artifacts).map((key) => `${step.worker}:${key}`),
+    }))
     record.events.push(event(record.session_id, "worker_completed", stageForWorker(step.worker), result.summary, new Date().toISOString(), step.worker))
     upsertLedger(record, step.worker, "completed", result.summary)
   }
@@ -1686,7 +1819,68 @@ function markReviewedRoleCWorkers(record: InteractiveSessionRecord): void {
   for (const worker of interactiveSessionProductionBoundary().reviewed_role_c_workers) {
     upsertLedger(record, worker, "completed", `Role C reviewed ${worker} output`)
     record.events.push(event(record.session_id, "worker_completed", stageForWorker(worker), `Role C reviewed ${worker} output`, new Date().toISOString(), worker))
+    appendAgentExecution(record, executionRecord(worker, "reviewed_pipeline", "completed", `Role C reviewed ${worker} output`, {
+      callId: `${record.session_id}-R${record.round_no}-role-c-${worker}-C${(record.private.role_c_generation_attempt ?? 0) + 1}`,
+      inputRefs: ["profile", "formal-path-node", "rag-result"],
+      outputRefs: [`role-c:${worker}:public-release`],
+      evidenceRefs: ["role-c:review-reports"],
+      artifactRefs: [`role-c:${worker}:artifact`],
+    }))
   }
+}
+
+function executionRecord(
+  agent: string,
+  executionType: PublicAgentExecutionRecord["execution_type"],
+  status: PublicAgentExecutionRecord["status"],
+  summary: string,
+  options: {
+    callId: string
+    attempt?: number
+    stage?: string
+    inputRefs?: string[]
+    outputRefs?: string[]
+    evidenceRefs?: string[]
+    artifactRefs?: string[]
+    dependencyCallIds?: string[]
+    timestamp?: string
+    error?: PublicAgentExecutionRecord["error"]
+  },
+): Omit<PublicAgentExecutionRecord, "record_id" | "round_no" | "timestamp"> & { timestamp?: string } {
+  return {
+    call_id: options.callId,
+    attempt: options.attempt ?? 1,
+    execution_type: executionType,
+    agent,
+    stage: options.stage ?? (agent === "tiered-evaluator" ? "assessment" : "objective_diagnosis"),
+    status,
+    summary,
+    input_refs: options.inputRefs ?? [],
+    output_refs: options.outputRefs ?? [],
+    evidence_refs: options.evidenceRefs ?? [],
+    artifact_refs: options.artifactRefs ?? [],
+    dependency_call_ids: options.dependencyCallIds ?? [],
+    ...(options.timestamp ? { timestamp: options.timestamp } : {}),
+    ...(options.error ? { error: options.error } : {}),
+  }
+}
+
+function appendOrchestratorDecision(
+  record: InteractiveSessionRecord,
+  action: string,
+  reasonCodes: string[],
+  outputRef: string,
+): void {
+  appendAgentExecution(record, executionRecord("learning-orchestrator", "orchestrator_decision", "completed", `next action selected: ${action}`, {
+    callId: `${record.session_id}-R${record.round_no}-decision`,
+    stage: "assessment",
+    inputRefs: ["feedback:public", ...reasonCodes.map((code) => `reason:${code}`)],
+    outputRefs: [`decision:${action}`, outputRef],
+    dependencyCallIds: record.execution_ledger
+      .filter((entry) => entry.round_no === record.round_no && entry.agent === "tiered-evaluator" && entry.status === "completed")
+      .slice(-1)
+      .map((entry) => entry.call_id),
+  }))
 }
 
 function publicUpstreamArtifacts(artifacts: Record<string, unknown>): Record<string, unknown> {
