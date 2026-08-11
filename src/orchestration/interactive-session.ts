@@ -33,6 +33,7 @@ import { RoleBLearningProgressAdapter } from "../role-b-profile/teaching-audit/l
 import { createLocalBPathPlanningPort } from "../role-c-content/review/local-b-path-planning-port"
 import type { KnowledgeBase } from "../knowledge/types"
 import type { LearnerProfileSnapshot } from "../role-c-content/contracts/profile-adapter"
+import { appendAgentExecution, type PublicAgentExecutionRecord } from "./agent-execution-ledger"
 
 export type InteractiveSessionStatus = "waiting_for_user" | "running" | "completed" | "blocked" | "failed"
 export type InteractiveStage = "objective_diagnosis" | "assessment" | "completed" | "blocked" | "failed"
@@ -82,6 +83,7 @@ export interface InteractiveSessionRecord {
     items: unknown[]
   }
   worker_ledger: PublicWorkerLedgerEntry[]
+  execution_ledger: PublicAgentExecutionRecord[]
   profile: unknown | null
   formal_path: unknown | null
   current_path_node: unknown | null
@@ -223,6 +225,7 @@ export class InteractiveSessionStore {
         { worker: "self-assessor", status: "completed", summary: "已收集学习者自评", updated_at: now },
         { worker: "objective-diagnostician", status: "waiting_for_user", summary: "等待诊断作答", updated_at: now },
       ],
+      execution_ledger: [],
       profile: null,
       formal_path: null,
       current_path_node: null,
@@ -659,6 +662,7 @@ function normalizeSessionRecord(record: InteractiveSessionRecord): InteractiveSe
     revision: Number.isSafeInteger(record.revision) && record.revision >= 0 ? record.revision : 0,
     code_execution: record.code_execution ?? null,
     adaptation: record.adaptation ?? null,
+    execution_ledger: Array.isArray(record.execution_ledger) ? record.execution_ledger : [],
     private: {
       diagnosis_answer_key: record.private?.diagnosis_answer_key ?? {},
       diagnosis_answers: record.private?.diagnosis_answers ?? null,
@@ -1196,6 +1200,24 @@ async function generateFormalRoleCRound(
   let lastReason = ""
   for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt++) {
     const runId = roleCRoundRunId(record.run_id, record.round_no, baseAttempt + attempt)
+    const callId = `${record.session_id}-${runId}`
+    appendAgentExecution(record, executionRecord({
+      callId,
+      attempt: baseAttempt + attempt + 1,
+      executionType: "reviewed_pipeline",
+      agent: "role-c-reviewed-pipeline",
+      stage: "assessment",
+      status: "invoked",
+      inputRefs: [
+        `profile:${record.run_id}-profile-E${record.private.profile_epoch ?? 0}`,
+        `path-node:${node.node_id}`,
+        ...currentRagResult.results.map((entry) => `source:${entry.source_id ?? entry.sourceId}`),
+      ],
+      dependencyCallIds: record.execution_ledger
+        .filter((entry) => entry.agent === "path-planner" && entry.status === "completed")
+        .slice(-1)
+        .map((entry) => entry.call_id),
+    }))
     const result = await generateRoleCForRoleDWithRuntime({
       profile: record.profile as LearnerProfile,
       ragResult: currentRagResult,
@@ -1210,9 +1232,31 @@ async function generateFormalRoleCRound(
       ...(nextRoundContext ? { next_round_context: nextRoundContext } : {}),
     }, roleCRuntime(dataRoot))
     if (result.status === "ready") {
-      if (!result.reviewedRelease) return { ok: false, reason: "Role C ready result omitted reviewed public release" }
+      if (!result.reviewedRelease) {
+        appendAgentExecution(record, executionRecord({
+          callId,
+          attempt: baseAttempt + attempt + 1,
+          executionType: "reviewed_pipeline",
+          agent: "role-c-reviewed-pipeline",
+          stage: "assessment",
+          status: "failed",
+          error: { code: "REVIEWED_RELEASE_MISSING", retryable: false },
+        }))
+        return { ok: false, reason: "Role C ready result omitted reviewed public release" }
+      }
       const [conceptLesson, codeLab, assessment] = result.reviewedRelease.artifacts
       record.private.role_c_generation_attempt = baseAttempt + attempt
+      appendAgentExecution(record, executionRecord({
+        callId,
+        attempt: baseAttempt + attempt + 1,
+        executionType: "reviewed_pipeline",
+        agent: "role-c-reviewed-pipeline",
+        stage: "assessment",
+        status: "completed",
+        outputRefs: [result.reviewedRelease.delivery_id],
+        evidenceRefs: result.reviewedRelease.trace_events.map((entry) => `trace:${entry.run_id}:${entry.seq}`),
+        artifactRefs: result.reviewedRelease.artifacts.map((artifact) => artifact.artifact_id),
+      }))
       return {
         ok: true,
         run_id: result.runId,
@@ -1231,6 +1275,16 @@ async function generateFormalRoleCRound(
       }
     }
     lastReason = result.reason ?? `Role C generation failed (attempt ${attempt + 1})`
+    appendAgentExecution(record, executionRecord({
+      callId,
+      attempt: baseAttempt + attempt + 1,
+      executionType: "reviewed_pipeline",
+      agent: "role-c-reviewed-pipeline",
+      stage: "assessment",
+      status: result.status,
+      outputRefs: result.workflow.map((entry) => entry.id),
+      error: { code: result.status === "failed" ? "ROLE_C_PIPELINE_FAILED" : "ROLE_C_PIPELINE_BLOCKED", retryable: shouldRetryWholeGenerationReason(lastReason) },
+    }))
     console.warn(`[orchestrator] Role C round ${record.round_no} attempt ${attempt + 1}/${MAX_GENERATION_ATTEMPTS} blocked: ${lastReason}`)
     if (!shouldRetryWholeGenerationReason(lastReason)) break
   }
@@ -1593,7 +1647,17 @@ async function continueAfterDiagnosis(
   upstreamArtifacts["learner-memory"] = memory
 
   record.private.diagnosis_answers = structuredClone(answers as Record<string, string>)
+  let previousAdapterCallId: string | undefined
   for (const step of ORCHESTRATION_WORKER_SEQUENCE.slice(3, 5)) {
+    const callId = `${record.session_id}-R${record.round_no}-${step.worker}-A1`
+    appendAgentExecution(record, executionRecord({
+      callId,
+      agent: step.worker,
+      stage: stageForWorker(step.worker),
+      status: "invoked",
+      inputRefs,
+      dependencyCallIds: previousAdapterCallId ? [previousAdapterCallId] : [],
+    }))
     record.events.push(event(record.session_id, "worker_invoked", stageForWorker(step.worker), `invoke ${step.worker}`, new Date().toISOString(), step.worker))
     const invocation = {
       ...createScaffoldWorkerInvocation({
@@ -1618,12 +1682,35 @@ async function continueAfterDiagnosis(
         ? result.errors[0]?.message ?? result.summary
         : validation.errors[0]?.message ?? "worker contract invalid"
       record.blocked_reason = failureMessage
+      appendAgentExecution(record, executionRecord({
+        callId,
+        agent: step.worker,
+        stage: stageForWorker(step.worker),
+        status: record.status === "blocked" ? "blocked" : "failed",
+        inputRefs: invocation.input_refs,
+        dependencyCallIds: previousAdapterCallId ? [previousAdapterCallId] : [],
+        error: {
+          code: validation.ok ? result.errors[0]?.code ?? "WORKER_NOT_COMPLETED" : "WORKER_CONTRACT_INVALID",
+          retryable: result.status === "blocked",
+        },
+      }))
       record.events.push(event(record.session_id, "session_blocked", record.current_stage, record.blocked_reason, new Date().toISOString(), step.worker))
       record.updated_at = new Date().toISOString()
       return record
     }
     upstreamArtifacts[step.worker] = result.artifacts
     inputRefs = result.output_refs
+    appendAgentExecution(record, executionRecord({
+      callId,
+      agent: step.worker,
+      stage: stageForWorker(step.worker),
+      status: "completed",
+      inputRefs: invocation.input_refs,
+      outputRefs: result.output_refs,
+      evidenceRefs: invocation.evidence_refs.map((entry) => entry.ref_id),
+      dependencyCallIds: previousAdapterCallId ? [previousAdapterCallId] : [],
+    }))
+    previousAdapterCallId = callId
     record.events.push(event(record.session_id, "worker_completed", stageForWorker(step.worker), result.summary, new Date().toISOString(), step.worker))
     upsertLedger(record, step.worker, "completed", result.summary)
   }
@@ -1686,6 +1773,36 @@ function markReviewedRoleCWorkers(record: InteractiveSessionRecord): void {
   for (const worker of interactiveSessionProductionBoundary().reviewed_role_c_workers) {
     upsertLedger(record, worker, "completed", `Role C reviewed ${worker} output`)
     record.events.push(event(record.session_id, "worker_completed", stageForWorker(worker), `Role C reviewed ${worker} output`, new Date().toISOString(), worker))
+  }
+}
+
+function executionRecord(input: {
+  callId: string
+  attempt?: number
+  executionType?: PublicAgentExecutionRecord["execution_type"]
+  agent: string
+  stage: string
+  status: PublicAgentExecutionRecord["status"]
+  inputRefs?: string[]
+  outputRefs?: string[]
+  evidenceRefs?: string[]
+  artifactRefs?: string[]
+  dependencyCallIds?: string[]
+  error?: PublicAgentExecutionRecord["error"]
+}): Omit<PublicAgentExecutionRecord, "record_id" | "round_no" | "timestamp"> {
+  return {
+    call_id: input.callId,
+    attempt: input.attempt ?? 1,
+    execution_type: input.executionType ?? "deterministic_adapter",
+    agent: input.agent,
+    stage: input.stage,
+    status: input.status,
+    input_refs: input.inputRefs ?? [],
+    output_refs: input.outputRefs ?? [],
+    evidence_refs: input.evidenceRefs ?? [],
+    artifact_refs: input.artifactRefs ?? [],
+    dependency_call_ids: input.dependencyCallIds ?? [],
+    ...(input.error ? { error: input.error } : {}),
   }
 }
 
