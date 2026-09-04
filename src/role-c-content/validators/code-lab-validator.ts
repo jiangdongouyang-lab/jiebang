@@ -17,8 +17,16 @@ import {
   validatePracticalGuideForRelease,
 } from "./section-six-resource-validator"
 import { classifyExpectedValue, classifyOutputContract } from "../contracts/output-contract"
-import { validateGapLearnerContract, validateGapTemplate } from "../programming/gap-template"
+import { failClosedStarterCode, validateGapLearnerContract, validateGapTemplate } from "../programming/gap-template"
 import { validateInputCandidates } from "../programming/test-plan"
+import { describePythonEntryPoint } from "../programming/python-function-interface"
+import { validateCodeLabReflectionQuestions } from "../programming/reflection-grounding"
+import {
+  executePublicLabInputs,
+  materializeTrustedPublicExpectations,
+  publicLabInputCases,
+} from "../security/public-lab-inputs"
+import { validatePythonProgramEntry } from "../security/python-program-entry"
 
 export interface CodeLabDraftValidationReport {
   ok: boolean
@@ -57,6 +65,8 @@ export function validateCodeLabPublicStage(
       } else {
         validateGapTemplate(programmingTask.gap_template).forEach((message) =>
           issues.push(issue("invalid_gap_template", "$.programming_task.gap_template", message)))
+        analyzePythonSource(failClosedStarterCode(programmingTask.gap_template), publicPayload.execution_contract).forEach((entry) =>
+          issues.push(issue(entry.code, "$.programming_task.gap_template.template_code", entry.message)))
         validateGapLearnerContract({ ...programmingTask, gap_template: programmingTask.gap_template }).forEach((message) =>
           issues.push(issue("unclear_gap_task", "$.programming_task", message)))
       }
@@ -88,6 +98,8 @@ export function validateCodeLabPublicStage(
   for (const message of validateExecutionContractResultSemantics(publicPayload.execution_contract)) {
     issues.push(issue("invalid_execution_result_contract", "$.execution_contract.output_contract", message))
   }
+  validateCodeLabReflectionQuestions(publicPayload.reflection_questions).forEach((message) =>
+    issues.push(issue("unsupported_reflection_question", "$.reflection_questions", message)))
   const targetIds = new Set(request.generation_spec.targets.map((target) => target.objective_id))
   const coreTargets = request.generation_spec.targets.filter((target) => target.importance === "core")
   const blocks = uniqueMap(publicPayload.instructions, "block_id", "$.instructions", issues)
@@ -218,6 +230,12 @@ export function validateCodeLabDraftStructure(
   const hintLadders = uniqueMap(publicPayload.hint_ladders, "objective_id", "$.public_draft.payload.hint_ladders", issues)
   const programmingProblem = request.resource_blueprint?.code_lab.programming_problem
   if (programmingProblem) {
+    const functionInterface = publicPayload.execution_contract.execution_mode === "function"
+      ? describePythonEntryPoint(
+          securePayload.reference_solution,
+          publicPayload.execution_contract.entry_point,
+        )
+      : undefined
     const quality = validateInputCandidates(
       programmingProblem,
       publicPayload.programming_task?.public_examples ?? publicPayload.public_tests,
@@ -227,6 +245,7 @@ export function validateCodeLabDraftStructure(
         input: test.input,
         note: test.note ?? "",
       })),
+      functionInterface,
     )
     quality.issues.forEach((message) => issues.push(issue(
       message.includes("重叠") ? "public_hidden_input_overlap"
@@ -269,7 +288,11 @@ export function validateCodeLabDraftStructure(
   issues.push(...validateFrozenStdinTokenShapes(
     request,
     publicPayload.public_tests.map((test) => ({ id: test.test_id, input: test.input })),
-    securePayload.hidden_tests.map((test) => ({ id: test.test_id, input: test.input })),
+    securePayload.hidden_tests.map((test) => ({
+      id: test.test_id,
+      input: test.input,
+      partition_id: test.partition_id,
+    })),
   ))
 
   const claims = publicPayload.instructions.flatMap((block) => "claims" in block ? block.claims : [])
@@ -406,10 +429,14 @@ type StdinTokenKind = "integer" | "decimal" | "boolean" | "text"
  * parser failed only in Docker.  Freeze the lexical token shape before trusted
  * execution while still allowing variable-length homogeneous lists.
  */
-function validateFrozenStdinTokenShapes(
+export function validateFrozenStdinTokenShapes(
   request: CodeLabRequest,
   publicTests: Array<{ id: string; input: unknown }>,
-  hiddenTests: Array<{ id: string; input: unknown }>,
+  hiddenTests: Array<{
+    id: string
+    input: unknown
+    partition_id?: "nominal" | "boundary" | "anti_hardcode" | "error_path"
+  }>,
 ): ValidationIssue[] {
   if (request.resource_blueprint?.code_lab.task_contract.stdin_layout !== "single_line_text") return []
   const publicShapes = publicTests.flatMap((test) =>
@@ -423,9 +450,16 @@ function validateFrozenStdinTokenShapes(
   for (const test of hiddenTests) {
     if (typeof test.input !== "string") continue
     const hiddenShape = stdinTokenShape(test.input)
-    const compatible = homogeneousKind
+    // Nominal and anti-hardcode cases are new data in the same input grammar,
+    // so their lexical token types stay frozen.  Boundary/error-path cases are
+    // allowed to exercise empty, missing or malformed values explicitly
+    // requested by the test partition; trusted execution remains the arbiter
+    // of whether the reference implementation actually handles them.
+    const permitsShapeDeviation = test.partition_id === "boundary"
+      || test.partition_id === "error_path"
+    const compatible = permitsShapeDeviation || (homogeneousKind
       ? hiddenShape.length > 0 && hiddenShape.every((kind) => kind === homogeneousKind)
-      : publicShapes.some((shape) => sameTokenShape(shape, hiddenShape))
+      : publicShapes.some((shape) => sameTokenShape(shape, hiddenShape)))
     if (!compatible) {
       issues.push(issue(
         "stdin_token_shape_mismatch",
@@ -487,6 +521,7 @@ export function classifyCodeLabVerificationFailure(input: CodeLabVerificationDia
     const empty = (value: unknown) => Boolean(value && typeof value === "object" && !Array.isArray(value)
       && Array.isArray((value as { args?: unknown }).args)
       && (value as { args: unknown[] }).args.length === 0
+      && Object.keys(((value as { files?: unknown }).files ?? {}) as object).length === 0
       && Object.keys(((value as { kwargs?: unknown }).kwargs ?? {}) as object).length === 0)
     return !((input.public_payload?.public_tests ?? []).every((test) => empty(test.input))
       && (input.secure_payload?.hidden_tests ?? []).every((test) => empty(test.input)))
@@ -563,9 +598,13 @@ export class TrustedCodeLabVerifier implements CodeLabDraftVerifier {
         derive_expected: true,
       }, request.generation_spec.policies.max_tool_retry)
       if (oracle.status !== "passed" || oracle.derived_outputs?.length !== pendingSuite.tests.length) {
-        return result(false, [
-          `可信参考解无法物化 expected：${oracle.failure_codes.join("、") || oracle.status}`,
-        ], this.runner.runner_image_digest, 0, 0, report.objective_coverage)
+        return {
+          ...result(false, [
+            `可信参考解无法物化 expected：${oracle.failure_codes.join("、") || oracle.status}`,
+          ], this.runner.runner_image_digest, 0, 0, report.objective_coverage),
+          reference_failed: true,
+          reference_failure_codes: [...oracle.failure_codes],
+        }
       }
       if (draft.secure_draft.payload.secondary_reference_solution) {
         const secondary = await executeTrustedReferenceWithRetry(this.runner, {
@@ -601,8 +640,40 @@ export class TrustedCodeLabVerifier implements CodeLabDraftVerifier {
       }
     }
 
-    const publicPayload = draft.public_draft.payload
-    const securePayload = draft.secure_draft.payload
+    let publicPayload = draft.public_draft.payload
+    let securePayload = draft.secure_draft.payload
+    if (publicPayload.programming_task) {
+      const publicProbe = await executePublicLabInputs(
+        this.runner,
+        publicPayload,
+        securePayload.reference_solution,
+        request.generation_spec.policies.max_tool_retry,
+      )
+      if (publicProbe.status !== "passed") return {
+        ...result(false, [`PUBLIC_REFERENCE_INPUT_FAILED:${publicProbe.failure_codes.join("、") || publicProbe.status}`], this.runner.runner_image_digest, 0, 0, report.objective_coverage),
+        ...(materializedDraft ? { materialized_draft: materializedDraft } : {}),
+      }
+      if (publicProbe.derived_outputs?.length !== publicLabInputCases(publicPayload).length) return {
+        ...result(false, ["PUBLIC_REFERENCE_OUTPUT_DERIVATION_FAILED"], this.runner.runner_image_digest, 0, 0, report.objective_coverage),
+        ...(materializedDraft ? { materialized_draft: materializedDraft } : {}),
+      }
+      const trustedPublic = materializeTrustedPublicExpectations(
+        publicPayload,
+        publicProbe.derived_outputs,
+      )
+      if (JSON.stringify(trustedPublic) !== JSON.stringify(publicPayload)) {
+        materializedDraft = structuredClone(draft)
+        materializedDraft.public_draft.payload = trustedPublic
+        draft = materializedDraft
+        report = validateCodeLabDraftStructure(request, draft)
+        if (!report.ok) return {
+          ...result(false, report.issues.map((entry) => `${entry.path}: ${entry.message}`), this.runner.runner_image_digest, 0, 0, report.objective_coverage),
+          materialized_draft: materializedDraft,
+        }
+        publicPayload = draft.public_draft.payload
+        securePayload = draft.secure_draft.payload
+      }
+    }
     const suite: RunnerTestSuite = {
       test_suite_id: securePayload.test_suite_id,
       execution_contract: publicPayload.execution_contract,
@@ -803,8 +874,25 @@ function staticIssues(publicPayload: CodeLabPublicPayload, securePayload: CodeLa
     ["$.public_draft.payload.starter_code", publicPayload.starter_code],
     ["$.secure_draft.payload.reference_solution", securePayload.reference_solution],
   ] as const
-  return sources.flatMap(([path, source]) => analyzePythonSource(source, publicPayload.execution_contract)
+  const issues = sources.flatMap(([path, source]) => analyzePythonSource(source, publicPayload.execution_contract)
     .map((entry) => issue(`static_${entry.code}`, path, entry.message)))
+  if (publicPayload.execution_contract.execution_mode !== "stdin_stdout") return issues
+  const executableSources: Array<[string, string]> = [
+    ["$.secure_draft.payload.reference_solution", securePayload.reference_solution],
+    ...(securePayload.secondary_reference_solution
+      ? [["$.secure_draft.payload.secondary_reference_solution", securePayload.secondary_reference_solution] as [string, string]]
+      : []),
+    ...securePayload.mutation_variants.map((entry, index) => [
+      `$.secure_draft.payload.mutation_variants[${index}].code`,
+      entry.code,
+    ] as [string, string]),
+  ]
+  for (const [path, source] of executableSources) {
+    for (const entry of validatePythonProgramEntry(source)) {
+      issues.push(issue(entry.code, path, entry.message))
+    }
+  }
+  return issues
 }
 
 function validateClaimGrounding(

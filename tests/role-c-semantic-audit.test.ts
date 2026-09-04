@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import type { ModelGateway, StructuredModelRequest } from "../src/role-c-content/contracts/model-gateway"
 import type { AssessmentPublicArtifact } from "../src/role-c-content/contracts/artifacts"
-import { extractAssessmentBlocks } from "../src/role-c-content/review/extract-review-blocks"
+import { extractAssessmentBlocks, extractCodeLabBlocks, extractConceptBlocks } from "../src/role-c-content/review/extract-review-blocks"
 import {
   ModelContentSemanticAuditPort,
   ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT,
 } from "../src/role-c-content/review/model-semantic-audit-port"
+import { ROLE_C_COMMON_SYSTEM_POLICY, ROLE_C_SCENARIO_EVIDENCE_POLICY } from "../src/role-c-content/prompts/common-policy"
+import { CONCEPT_SEGMENT_SYSTEM_PROMPT_V2 } from "../src/role-c-content/prompts/concept-tutor/staged.prompt"
 
 class AuditGateway implements ModelGateway {
   readonly model_id = "semantic-audit-test-model"
@@ -42,6 +44,33 @@ function auditInput() {
 }
 
 describe("Role C model semantic fact audit", () => {
+  test("即时检查把指定答案和反馈解释一同交给语义审核", () => {
+    const blocks = extractConceptBlocks({ payload: {
+      objective_coverage: [], prerequisite_bridge: [], explanation_blocks: [], summary: [],
+      worked_examples: [], misconceptions: [], hint_ladders: [],
+      micro_checks: [{
+        block_id: "CHECK", item_id: "ITEM", prompt: "哪项正确？",
+        options: [
+          { option_id: "A", label: "A", text: "程序通常由解释器执行" },
+          { option_id: "B", label: "B", text: "程序不由解释器执行" },
+        ],
+        answer_option_id: "B", answer_explanation: "程序由编译器直接转换为硬件指令。",
+        citations: [{ source_id: "K001", fact_id: "F002", relation: "supports" }],
+      }],
+    } } as any)
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]!.surface_kind).toBe("choice_assessment")
+    expect(blocks[0]!.text).toContain("即时反馈指定答案：B：程序不由解释器执行")
+    expect(blocks[0]!.text).toContain("即时反馈解释：程序由编译器直接转换为硬件指令。")
+    expect(ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT).toContain("指定答案就是该唯一正确项")
+  })
+  test("作者与审核共享虚构情境边界，段落允许显式引用同目标的支持事实", () => {
+    expect(ROLE_C_COMMON_SYSTEM_POLICY).toContain(ROLE_C_SCENARIO_EVIDENCE_POLICY)
+    expect(ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT).toContain(ROLE_C_SCENARIO_EVIDENCE_POLICY)
+    expect(ROLE_C_SCENARIO_EVIDENCE_POLICY).toContain("虚构标签不能豁免这些专业规则")
+    expect(CONCEPT_SEGMENT_SYSTEM_PROMPT_V2).toContain("slot.fact_ids 与 used_fact_ids 的并集")
+    expect(CONCEPT_SEGMENT_SYSTEM_PROMPT_V2).not.toContain("也不得提前借用或挪到当前 slot")
+  })
   test("reviews a choice question and its distractors as one semantic unit", () => {
     const blocks = extractAssessmentBlocks({
       payload: {
@@ -75,6 +104,38 @@ describe("Role C model semantic fact audit", () => {
     expect(ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT).toContain("确定唯一正确选项")
     expect(ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT).toContain("不得以“证据未列出具体序列”为由判为 unsupported")
     expect(ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT).toContain("cited_examples 可以支持该示例实际展示的代码形状")
+    expect(ROLE_C_SEMANTIC_AUDIT_SYSTEM_PROMPT).toContain("task_context 是已发布的题内材料")
+  })
+
+  test("反思题携带同一公开实验的 starter 和公开样例作为题内上下文", () => {
+    const [reflection] = extractCodeLabBlocks({
+      status: "ready",
+      artifact_id: "LAB-ART-1",
+      payload: {
+        lab_id: "LAB-1",
+        title: "输出三条笔记",
+        objective_ids: ["OBJ-1"],
+        instructions: [],
+        execution_contract: {
+          language: "python", execution_mode: "stdin_stdout", allowed_imports: [],
+          input_contract: { type: "none", constraints: [] },
+          output_contract: { type: "stdout text", constraints: ["输出三行"] },
+          resource_limits: { timeout_ms: 1000, memory_mb: 64, max_output_bytes: 4096 },
+        },
+        starter_code: "print(note_1)\nprint(note_2)\nprint(note_3)\n",
+        public_tests: [{
+          test_id: "P1", objective_id: "OBJ-1", description: "运行程序",
+          input: "", expected_behavior: "依次输出三条笔记", citations: [],
+        }],
+        hint_ladders: [],
+        reflection_questions: ["三条要点分别对应哪一行 print？"],
+        objective_coverage: [],
+        used_evidence: [{ source_id: "K001", fact_id: "F001", relation: "supports" }],
+      },
+    } as any).filter((block) => block.locator.field === "reflection")
+
+    expect(reflection?.task_context).toContain("print(note_3)")
+    expect(reflection?.task_context).toContain("依次输出三条笔记")
   })
 
   test("audits one complete artifact in a single structured model call", async () => {

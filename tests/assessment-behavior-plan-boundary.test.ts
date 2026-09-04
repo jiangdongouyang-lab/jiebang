@@ -40,6 +40,44 @@ describe("B observable behavior controls C assessment modalities", () => {
     expect(plan.map((item) => item.cognitive_demand)).toEqual(["understand", "understand"])
   })
 
+  test("多题测评按画像允许的题型轮换，不会每题都取第一个偏好", () => {
+    const node = {
+      schema_version: "1.0", node_id: "N2B", target_source_ids: ["K001"], prerequisite_source_ids: [], goal: "Python 概念",
+      objectives: [{ objective_id: "O2B", source_id: "K001", required_fact_ids: ["F001", "F002", "F004"], observable_behavior: "explain", importance: "core" }],
+      assessment_blueprint: { tier_1_count: 3, tier_2_count: 2, tier_3_count: 0, required_modalities: ["short_answer"] },
+    }
+    const facts = ["F001", "F002", "F004"]
+    const plan = buildAssessmentItemPlan({
+      spec_id: "S2B", run_id: "R2B", path_node: node, targets: node.objectives,
+      learner_adaptation: {
+        level: "beginner", known_concepts: [], weak_concepts: ["K001"], preferred_contexts: [], scaffold_level: 3,
+        pedagogy_contract: {
+          assessment: { preferred_modalities: ["mcq", "true_false", "short_answer"], require_direct_core_measurement: true },
+        },
+      },
+      assessment_blueprint: node.assessment_blueprint, policies: { seed: 1 },
+    } as any, {
+      results: [{
+        source_id: "K001",
+        facts: facts.map((fact_id) => ({ fact_id, capabilities: ["definition"] })),
+      }],
+    } as any)
+    expect(plan.map((item) => item.modality)).toEqual([
+      "mcq", "true_false", "mcq", "short_answer", "true_false",
+    ])
+    const trueFalseFacts = plan
+      .filter((item) => item.modality === "true_false")
+      .map((item) => item.citations.map((citation) => citation.fact_id))
+    expect(trueFalseFacts).toEqual([["F001"], ["F002"]])
+    const mcqFacts = plan
+      .filter((item) => item.modality === "mcq")
+      .map((item) => item.citations.map((citation) => citation.fact_id))
+    expect(mcqFacts).toEqual([
+      ["F001", "F002"],
+      ["F002", "F004"],
+    ])
+  })
+
   test("recognize 的 mcq 保持理解测量，并提供两条事实设计有效对照", () => {
     const node = {
       schema_version: "1.0", node_id: "N3", target_source_ids: ["K001"], prerequisite_source_ids: [], goal: "Python 是什么",
@@ -76,6 +114,28 @@ describe("B observable behavior controls C assessment modalities", () => {
     }] as any)
     expect(issues.join("\n")).toContain("冻结为事实识别题")
     expect(issues.join("\n")).toContain("不能索要具体值")
+  })
+
+  test("函数模式代码题在公开命题阶段就拒绝 stdin 输入渠道", () => {
+    const issues = validateAssessmentPublicAuthorAgainstPlan({
+      title: "输入测评",
+      items: [{
+        prompt: "补全 read_user_value，通过 input() 读取一行文字并返回。",
+        options: null,
+        starter_code: "def read_user_value():\n    # TODO\n    raise NotImplementedError('TODO')",
+        structure_meta: {
+          operation: "函数构造",
+          reasoning_pattern: "读取后返回",
+          representation: "函数",
+          context_family: "direct",
+          answer_form: "code",
+        },
+      }],
+    } as any, [{
+      modality: "code",
+      cognitive_operation: "construct_solution",
+    }] as any)
+    expect(issues.join("\n")).toContain("不得调用 input()/stdin")
   })
 
   test("误区需要的事实未全部进入本题 citations 时不会强制绑定", () => {

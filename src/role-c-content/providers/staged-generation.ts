@@ -46,6 +46,11 @@ import {
 } from "../planning/practical-guide-plan"
 import { failClosedStarterCode, validateGapLearnerContract, validateGapTemplate } from "../programming/gap-template"
 import type { ProgrammingProblemBlueprint } from "../programming/contracts"
+import {
+  describePythonEntryPoint,
+  validateFunctionInvocationAgainstInterface,
+} from "../programming/python-function-interface"
+import { validateCodeLabReflectionQuestions } from "../programming/reflection-grounding"
 
 export interface ConceptSegmentRequest extends ConceptTutorRequest {
   segment_index: number
@@ -179,6 +184,7 @@ export interface CodeLabTestInputsAuthorPayload {
 }
 
 export interface AssessmentItemPlan {
+  task_requirements?: { boundary_or_counterexample: boolean }
   item_id: string
   family_id: string
   variant_id: string
@@ -288,6 +294,9 @@ export function splitConceptRequest(
         prerequisite_source_ids: [...prerequisiteSources],
       },
       targets: structuredClone(targets),
+    }
+    if (spec.artifact_tasks) {
+      for (const task of Object.values(spec.artifact_tasks)) task.target_count = targetSources.length
     }
     const evidencePack: RagEvidencePack = {
       ...structuredClone(request.evidence_pack),
@@ -765,7 +774,12 @@ export function buildCodeLabObjectivePlan(
       // GenerationSpec.required_fact_ids 是整轮目标的完整事实覆盖合同；代码实验
       // 只应携带足以完成当前练习的最小证据切片，否则一个简单练习会把整章事实
       // 全部堆进 instruction、公开测试和提示。讲义与测评仍负责完整覆盖。
-      citations: codeLabFactIdsForTarget(
+      // An explicit artifact task has already frozen the needed core facts.
+      // Keep supporting objectives too: their operations are part of the same
+      // program and must not lose evidence when only the primary is parameterized.
+      citations: (spec.artifact_tasks?.code_lab
+        ? target.required_fact_ids
+        : codeLabFactIdsForTarget(
         target,
         evidence,
         executionIntent?.primary_objective_id === target.objective_id
@@ -774,7 +788,7 @@ export function buildCodeLabObjectivePlan(
           : target.observable_behavior,
         executionIntent?.primary_objective_id === target.objective_id
           && executionIntent.learner_action !== "recall_fact",
-      ).map((factId) => ({
+      )).map((factId) => ({
         source_id: target.source_id,
         fact_id: factId,
         relation: "derived_from" as const,
@@ -890,6 +904,9 @@ export function validateCodeLabPublicAuthorAgainstPlan(
   if (payload.objectives.length !== plan.length) {
     issues.push(`objectives 数量应为 ${plan.length}，实际 ${payload.objectives.length}`)
   }
+  issues.push(...validateCodeLabReflectionQuestions(
+    payload.objectives.map((objective) => objective.reflection_question),
+  ))
   payload.objectives.forEach((entry, index) => {
     if (entry.hints.length !== 3) {
       issues.push(`objectives[${index}].hints 必须恰好包含三级提示`)
@@ -978,6 +995,25 @@ export function validateCodeLabPublicAuthorAgainstPlan(
       issues.push(`${programmingProblem.task_kind} 不得返回 gap_template`)
     }
   }
+  if (programmingProblem?.task_kind === "debugging_repair") {
+    issues.push(...debuggingRepairDisclosureIssues(payload))
+  }
+  if (payload.execution_contract.execution_mode === "function") {
+    const entryPoint = payload.execution_contract.entry_point
+    const functionInterface = describePythonEntryPoint(payload.starter_code, entryPoint)
+    if (!functionInterface) {
+      issues.push(`starter_code 必须声明冻结入口函数 ${entryPoint ?? "（缺失）"} 的可解析签名`)
+    } else {
+      const publicInputs = [
+        ...payload.objectives.map((objective) => objective.public_test.input),
+        ...(payload.programming_task?.additional_public_examples ?? []).map((example) => example.input),
+      ]
+      publicInputs.forEach((input, index) => {
+        validateFunctionInvocationAgainstInterface(input, functionInterface)
+          .forEach((message) => issues.push(`公开测试 ${index + 1}：${message}`))
+      })
+    }
+  }
   issues.push(...codeLabExecutionContractIssues(
     payload.execution_contract,
     "execution_contract",
@@ -989,6 +1025,146 @@ export function validateCodeLabPublicAuthorAgainstPlan(
     ]),
     payload.starter_code,
   ))
+  return issues
+}
+
+const DEBUGGING_DEFECT_ENUMERATION = /(?:starter|当前|现有|起始|骨架).{0,24}(?:代码|程序)?.{0,48}(?:存在|包含|关注).{0,16}(?:[一二三四五六七八九两]|多|\d+)\s*(?:类|个|处)?(?:缺陷|错误|问题|故障)(?:点|为|如下|包括|[：:])/isu
+const DEBUGGING_NUMBERED_DEFECT = /(?:缺陷|错误|问题|故障)\s*[一二三四五六七八九两\d]+\s*[：:]/u
+const DEBUGGING_NAMED_DEFECT = /(?:条件分支缺陷|循环端点缺陷|列表索引缺陷)[：:]/u
+const DEBUGGING_DIRECT_REPAIR = /(?:把|将).{0,80}(?:改为|改成|替换为)\s*(?:`[^`]+`|["'][^"']+["']|[A-Za-z_]\w*(?:\s*\([^)]*\)|\s*\[[^\]]+\]|(?:\s*[+\-*/<>=]\s*[A-Za-z0-9_]+)+))|(?:应|应该|需要|请|确保|使).{0,50}(?:使用\s*)?(?:`[^`]+`|\brange\s*\([^)]*\)|\blen\s*\([^)]*\)(?:\s*-\s*1)?|[A-Za-z_]\w*\s*\[[^\]]+\]|从索引\s*0\s*开始|每个\s*elif\s*(?:检查|匹配))/iu
+
+/**
+ * Keeps the AI-authored task and faulty program, but places source-level repair
+ * directions at the learner-requested third hint level. Public instructions
+ * remain specific by referring to this candidate's own public check.
+ */
+export function projectDebuggingRepairPublicGuidance(
+  payload: CodeLabPublicAuthorPayload,
+): void {
+  const task = payload.programming_task
+  if (!task || !Array.isArray(payload.objectives)) return
+  if (DEBUGGING_DEFECT_ENUMERATION.test(task.statement)
+    || DEBUGGING_NUMBERED_DEFECT.test(task.statement)
+    || DEBUGGING_NAMED_DEFECT.test(task.statement)
+    || DEBUGGING_DIRECT_REPAIR.test(task.statement)) {
+    task.statement = [
+      `${payload.title || "本练习"}是一项故障定位与修复任务。starter 是一份可运行但不能满足全部公开检查的实现。`,
+      "请先运行公开样例，记录实际结果与预期行为最早出现差异的位置，再沿执行过程定位原因、完成修复并回归验证。",
+      `输入：${task.input_description}`,
+      `输出：${task.output_description}`,
+    ].join("\n\n")
+  }
+  payload.objectives.forEach((objective) => {
+    const checkName = objective.public_test?.description?.trim() || "本目标的公开检查"
+    const expected = objective.public_test?.expected_behavior?.trim() || "题面给出的预期行为"
+    if (DEBUGGING_DIRECT_REPAIR.test(objective.instruction_text)) {
+      objective.instruction_text = `运行“${checkName}”，比较实际结果与“${expected}”，定位并修复与本目标相关的首个偏差。`
+    }
+    if (!Array.isArray(objective.hints)) return
+    if (objective.hints.slice(0, 2).some((hint) => DEBUGGING_DIRECT_REPAIR.test(hint))) {
+      objective.hints[0] = `先运行“${checkName}”，记录实际结果与“${expected}”首次不同的位置。`
+      objective.hints[1] = "逐步追踪本目标涉及的条件、循环或数据访问状态，并用当前事实判断哪一步开始偏离。"
+    }
+  })
+  const guide = payload.practical_guide
+  if (!guide) return
+  guide.readiness_checks.forEach((entry) => {
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.check)) entry.check = "确认能够运行题面给出的公开样例并记录实际结果。"
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.ready_when)) entry.ready_when = "已经得到一组可与预期行为逐项比较的运行结果。"
+  })
+  guide.steps.forEach((entry) => {
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.action)) entry.action = "运行该步骤对应的公开样例，逐步记录相关状态并定位首次偏差。"
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.input)) entry.input = "使用该步骤列出的公开样例输入。"
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.expected_result)) entry.expected_result = "能够说明实际结果与题面预期行为的具体差异。"
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.verification)) entry.verification = "重新运行同一公开样例，确认实际结果与预期行为一致。"
+  })
+  guide.troubleshooting.forEach((entry) => {
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.likely_cause)) entry.likely_cause = "执行过程仍有一步偏离题面规定的预期行为。"
+    entry.recovery_steps = entry.recovery_steps.map((step) => DEBUGGING_DIRECT_REPAIR.test(step)
+      ? "缩小输入并逐步记录状态，定位首次偏差后只修复对应位置。"
+      : step)
+    if (DEBUGGING_DIRECT_REPAIR.test(entry.verification)) entry.verification = "用原公开样例重新运行并核对完整结果。"
+  })
+  if (DEBUGGING_DIRECT_REPAIR.test(guide.extension_task.task)) {
+    guide.extension_task.task = "保持当前输入输出合同，设计一组同形状的新输入并重复定位与验证。"
+  }
+  if (DEBUGGING_DIRECT_REPAIR.test(guide.extension_task.verification)) {
+    guide.extension_task.verification = "先写出预期行为，再运行程序逐项核对。"
+  }
+}
+
+function debuggingRepairDisclosureIssues(
+  payload: CodeLabPublicAuthorPayload,
+): string[] {
+  const issues: string[] = []
+  const statement = payload.programming_task?.statement ?? ""
+  const starter = payload.starter_code ?? ""
+  const executableStarterLines = starter.split(/\r?\n/u)
+    .map((line) => line.replace(/#.*$/u, "").trim())
+    .filter(Boolean)
+  if (/TODO|NotImplementedError|\bpass\b|待完成|待填写|补全/u.test(starter)
+    || executableStarterLines.length < 5) {
+    issues.push("debugging_repair starter 必须是完整可运行且含真实故障的实现，不得使用 TODO、pass 或空骨架代替故障（字段：starter_code）")
+  }
+  if (starter.split(/\r?\n/u).some((line) => /^\s*#/u.test(line)
+    && /(?:缺陷|错误|修复|改为|替换为|正确写法)/u.test(line))) {
+    issues.push("debugging_repair starter 注释不得公布缺陷位置、原因或修复方法（字段：starter_code）")
+  }
+  // A fault-localization task may state the intended behaviour and observable
+  // failure, but enumerating the faulty source expressions turns it into a
+  // transcription exercise before hints are even requested.
+  if (DEBUGGING_DEFECT_ENUMERATION.test(statement)
+    || DEBUGGING_NUMBERED_DEFECT.test(statement)
+    || DEBUGGING_NAMED_DEFECT.test(statement)) {
+    issues.push("debugging_repair 题面只能描述预期行为和可观察症状，不得逐项公布 starter 的源码级缺陷（字段：programming_task.statement）")
+  }
+  const guide = payload.practical_guide
+  const alwaysVisibleGuidance: Array<{ path: string; text: string }> = [
+    { path: "programming_task.statement", text: statement },
+    ...payload.objectives.flatMap((objective, index) => [
+      { path: `objectives[${index}].instruction_text`, text: objective.instruction_text },
+      { path: `objectives[${index}].reflection_question`, text: objective.reflection_question },
+    ]),
+    ...(guide ? [
+      { path: "practical_guide.practice_goal", text: guide.practice_goal },
+      { path: "practical_guide.deliverable", text: guide.deliverable },
+      ...guide.readiness_checks.flatMap((entry, index) => [
+        { path: `practical_guide.readiness_checks[${index}].title`, text: entry.title },
+        { path: `practical_guide.readiness_checks[${index}].check`, text: entry.check },
+        { path: `practical_guide.readiness_checks[${index}].ready_when`, text: entry.ready_when },
+      ]),
+      ...guide.steps.flatMap((entry, index) => [
+        { path: `practical_guide.steps[${index}].title`, text: entry.title },
+        { path: `practical_guide.steps[${index}].action`, text: entry.action },
+        { path: `practical_guide.steps[${index}].input`, text: entry.input },
+        { path: `practical_guide.steps[${index}].expected_result`, text: entry.expected_result },
+        { path: `practical_guide.steps[${index}].verification`, text: entry.verification },
+      ]),
+      ...guide.troubleshooting.flatMap((entry, index) => [
+        { path: `practical_guide.troubleshooting[${index}].symptom`, text: entry.symptom },
+        { path: `practical_guide.troubleshooting[${index}].likely_cause`, text: entry.likely_cause },
+        ...entry.recovery_steps.map((text, step) => ({
+          path: `practical_guide.troubleshooting[${index}].recovery_steps[${step}]`, text,
+        })),
+        { path: `practical_guide.troubleshooting[${index}].verification`, text: entry.verification },
+      ]),
+      { path: "practical_guide.extension_task.task", text: guide.extension_task.task },
+      { path: "practical_guide.extension_task.changed_dimension", text: guide.extension_task.changed_dimension },
+      { path: "practical_guide.extension_task.verification", text: guide.extension_task.verification },
+    ] : []),
+  ].filter((entry) => entry.text.trim().length > 0)
+  const directRepairPaths = alwaysVisibleGuidance
+    .filter((entry) => DEBUGGING_DIRECT_REPAIR.test(entry.text))
+    .map((entry) => entry.path)
+  if (directRepairPaths.length > 0) {
+    issues.push(`debugging_repair 题面、任务说明或实操指南不得直接给出源码替换方案（字段：${directRepairPaths.join("、")}）`)
+  }
+  const earlyHintPaths = payload.objectives.flatMap((objective, objectiveIndex) =>
+    objective.hints.slice(0, 2).flatMap((hint, hintIndex) =>
+      DEBUGGING_DIRECT_REPAIR.test(hint) ? [`objectives[${objectiveIndex}].hints[${hintIndex}]`] : []))
+  if (earlyHintPaths.length > 0) {
+    issues.push(`debugging_repair 前两级提示只能引导观察与定位；精确源码线索只能放在第三级提示（字段：${earlyHintPaths.join("、")}）`)
+  }
   return issues
 }
 
@@ -1521,7 +1697,16 @@ export function normalizeCodeLabSecureAuthorPayloadLenient(
   if (normalized.hidden_tests.length > plan.hidden_tests.length) {
     normalized.hidden_tests = normalized.hidden_tests.slice(0, plan.hidden_tests.length)
   }
-  for (const test of normalized.hidden_tests) {
+  normalized.hidden_tests.forEach((test, index) => {
+    const planned = plan.hidden_tests[index]
+    if (planned) {
+      const partition = planned.case_kind === "normal" ? "nominal" : planned.case_kind
+      test.partition_id = partition
+      // Hidden-test notes are operational metadata, not a teaching surface.
+      // Keep them deterministic and evidence-neutral so a test author cannot
+      // introduce new language/runtime claims while merely describing a case.
+      test.note = hiddenTestPartitionNote(partition)
+    }
     test.comparison ??= { kind: "exact" }
     if (test.expected !== undefined) {
       const outputKind = outputContract ? classifyOutputContract(outputContract) : undefined
@@ -1550,8 +1735,17 @@ export function normalizeCodeLabSecureAuthorPayloadLenient(
       // 否则 harness 无输入、reference 无输出，可信执行必然失败。
       test.input = asStandardInput(test.input)
     }
-  }
+  })
   return normalized
+}
+
+function hiddenTestPartitionNote(
+  partition: "nominal" | "boundary" | "anti_hardcode" | "error_path",
+): string {
+  if (partition === "nominal") return "典型输入：验证当前目标的主流程可正常完成。"
+  if (partition === "boundary") return "边界输入：验证题面已声明边界下的可观察结果。"
+  if (partition === "anti_hardcode") return "替换公开常量：验证实现未依赖公开样例硬编码。"
+  return "错误路径输入：验证题面已声明的无效输入处理结果。"
 }
 
 /** Maps model-authored comparison shapes onto the strict TestComparison contract. */
@@ -1997,9 +2191,17 @@ export function buildAssessmentItemPlan(spec: GenerationSpec, evidence?: RagEvid
   const baseItems = tiers.map((tier, index) => {
     const objective = assignments[index]
     const modality = modalities[index]
-    const objectiveOccurrence = assignments
+    // Rotate evidence within the same observable question family. Counting all
+    // questions for an objective made a later repeated modality wrap back to
+    // the same fact set (for example true/false #2 and #5 both received F002),
+    // so two independent authors were effectively given the same task. The
+    // family-local occurrence makes repeated modalities consume distinct fact
+    // relations before any model call.
+    const objectiveModalityOccurrence = assignments
       .slice(0, index)
-      .filter((entry) => entry.objective_id === objective.objective_id)
+      .filter((entry, priorIndex) =>
+        entry.objective_id === objective.objective_id
+        && modalities[priorIndex] === modality)
       .length
     const cognitiveOperation = cognitiveOperationFor(
       objective.observable_behavior,
@@ -2021,7 +2223,7 @@ export function buildAssessmentItemPlan(spec: GenerationSpec, evidence?: RagEvid
     const plannedFactIds = assessmentFactIdsForItem(
       objective.required_fact_ids,
       evidenceTier,
-      objectiveOccurrence,
+      objectiveModalityOccurrence,
       evidenceFacts,
       cognitiveOperation,
     )
@@ -2044,6 +2246,19 @@ export function buildAssessmentItemPlan(spec: GenerationSpec, evidence?: RagEvid
       })),
     }
   })
+  let boundaryItemId: string | undefined
+  if (spec.artifact_tasks?.assessment.assessment?.require_boundary_or_counterexample_item) {
+    for (const item of [...baseItems].reverse()) {
+      const objective = spec.targets.find(t => t.objective_id === item.objective_id)!
+      const fact = evidence?.results.find(s => s.source_id === objective.source_id)?.facts.find(f =>
+        objective.required_fact_ids.includes(f.fact_id) && (f.capabilities ?? []).some(c => c === "boundary" || c === "contrast"))
+      if (!fact) continue
+      if (!item.citations.some(c => c.fact_id === fact.fact_id)) item.citations.push({ source_id: objective.source_id, fact_id: fact.fact_id, relation: "derived_from" })
+      boundaryItemId = item.item_id
+      break
+    }
+    if (evidence && !boundaryItemId) throw new ModelOutputValidationError("assessment.plan", ["任务要求边界或反例题，但目标证据未提供边界或对比事实"])
+  }
   // 题目表现形式：确定性分配场景额度，避免每道题都套同一个 preferred context。
   const presentationPlan = buildAssessmentPresentationPlan(
     baseItems.map((item) => ({
@@ -2085,6 +2300,7 @@ export function buildAssessmentItemPlan(spec: GenerationSpec, evidence?: RagEvid
             : "analyze" as const
     return {
       ...item,
+      ...(boundaryItemId ? { task_requirements: { boundary_or_counterexample: item.item_id === boundaryItemId } } : {}),
       presentation_mode: presentation.mode,
       context_strategy: presentation.mode === "scenario_transfer" && presentation.context
         ? { kind: "preferred_context" as const, value: presentation.context }
@@ -2230,12 +2446,16 @@ function buildAssessmentModalities(
     ...spec.targets.filter((target) => target.importance === "core"),
     ...spec.targets.filter((target) => target.importance !== "core"),
   ]
+  const tierOccurrences = new Map<1 | 2 | 3, number>()
   const modalities = tiers.map((tier, index) => {
     const target = objectives[index % objectives.length]!
     const contractPreferences = spec.learner_adaptation?.pedagogy_contract?.assessment.preferred_modalities ?? []
-    return contractPreferences.find((modality) =>
+    const compatiblePreferences = contractPreferences.filter((modality) =>
       modalityAllowedAtTier(modality, tier)
       && modalityMeasuresBehavior(target.observable_behavior, modality))
+    const occurrence = tierOccurrences.get(tier) ?? 0
+    tierOccurrences.set(tier, occurrence + 1)
+    return compatiblePreferences[occurrence % compatiblePreferences.length]
       ?? preferredModalityForTier(target.observable_behavior, tier)
   })
   ensureRequiredModalities(
@@ -2326,6 +2546,9 @@ export function validateAssessmentPublicAuthorAgainstPlan(
     if (expected.modality === "code") {
       if (!assessmentStarterIsIncomplete(item.starter_code)) {
         issues.push(`items[${index}] 代码题必须提供明确未完成的函数 starter_code，不能直接给出完整答案`)
+      }
+      if (assessmentFunctionCodeUsesStdin(item.prompt, item.starter_code)) {
+        issues.push(`items[${index}] 正式代码题使用函数调用评分，题面和 starter_code 不得调用 input()/stdin；所有可变测试数据必须通过函数参数传入`)
       }
     } else if (item.starter_code !== null) {
       issues.push(`items[${index}] 非代码题的 starter_code 必须为 null`)
@@ -2701,11 +2924,22 @@ export function validateAssessmentPublicAgainstPlan(
     if (expected.modality === "code" && !item.starter_code) {
       issues.push(`items[${index}] 代码题缺少 starter_code`)
     }
+    if (expected.modality === "code" && assessmentFunctionCodeUsesStdin(item.prompt, item.starter_code)) {
+      issues.push(`items[${index}] 正式代码题使用函数调用评分，不得要求读取 input()/stdin；请把数据改为函数参数`)
+    }
     if (item.difficulty_band !== expected.difficulty_band || item.cognitive_level !== expected.cognitive_level) {
       issues.push(`items[${index}] 双重分阶未按 item plan 冻结`)
     }
   })
   return issues
+}
+
+function assessmentFunctionCodeUsesStdin(
+  prompt: string,
+  starterCode: string | null | undefined,
+): boolean {
+  const visible = `${prompt}\n${starterCode ?? ""}`.normalize("NFKC").toLocaleLowerCase()
+  return /\binput\s*\(|\bsys\.stdin\b|标准输入|\bstdin\b/u.test(visible)
 }
 
 export function normalizeAssessmentPublic(
@@ -3465,7 +3699,9 @@ function isFunctionInvocationEnvelope(value: unknown): boolean {
   const record = value as Record<string, unknown>
   const keys = Object.keys(record)
   return keys.length > 0
-    && keys.every((key) => key === "args" || key === "kwargs")
+    && keys.every((key) => key === "args" || key === "kwargs" || key === "files")
+    && (record.files === undefined || (record.files !== null && typeof record.files === "object" && !Array.isArray(record.files)
+      && Object.values(record.files as object).every((value) => typeof value === "string")))
     && Array.isArray(record.args)
     && (record.kwargs === undefined
       || (record.kwargs !== null

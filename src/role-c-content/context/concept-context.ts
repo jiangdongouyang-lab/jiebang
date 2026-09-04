@@ -1,9 +1,11 @@
+import { artifactDifficulty, type ArtifactTaskContractV2 } from "../contracts/artifact-task"
 import type { ConceptTutorRequest } from "../agents/types"
 import type { EvidenceFact } from "../contracts/evidence-pack"
 import { projectNextRoundContext } from "./next-round-context"
 
 export interface ConceptTutorModelInput {
   contract: {
+    artifact_task?: ArtifactTaskContractV2
     spec_id: string
     run_id: string
     path_node: ConceptTutorRequest["generation_spec"]["path_node"]
@@ -21,10 +23,6 @@ export interface ConceptTutorModelInput {
       title: string
       code: string
       explanation: string
-      fact_refs: Array<{ source_id: string; fact_id: string }>
-    }>
-    practice_tasks: Array<{
-      text: string
       fact_refs: Array<{ source_id: string; fact_id: string }>
     }>
   }>
@@ -84,27 +82,17 @@ export function buildConceptTutorModelInput(
         title: item.title,
         difficulty: item.difficulty,
         facts: boundFacts.map((fact) => ({ ...fact })),
-        // 改进方案6 第六/七节：examples / practice_tasks 此前被整段丢弃，
-        // 讲义模型只能反复改写 facts。这里按引用绑定投影，只有能绑定到
-        // required fact 的 example / practice 才进入可信生成；绑定不上的
-        // 只作候选，不进公开讲义 prompt。quiz_seeds.answer 仍绝不投影。
+        // Preserve A's full source-local reference closure. Similar wording
+        // cannot create provenance for a missing fact or an unbound task.
         examples: (item.examples ?? [])
+          .filter((example) => example.fact_refs?.length > 0 && example.fact_refs.every((ref) =>
+            ref.source_id === item.source_id && boundFacts.some((fact) => fact.fact_id === ref.fact_id)))
           .map((example) => ({
             title: example.title,
             code: example.code,
             explanation: example.explanation,
-            fact_refs: inferFactRefs(
-              `${example.title}\n${example.code}\n${example.explanation}`,
-              boundFacts,
-            ),
-          }))
-          .filter((example) => example.fact_refs.length > 0),
-        practice_tasks: (item.practice_tasks ?? [])
-          .map((text) => ({
-            text,
-            fact_refs: inferFactRefs(text, boundFacts),
-          }))
-          .filter((task) => task.fact_refs.length > 0),
+            fact_refs: example.fact_refs.map((ref) => ({ ...ref })),
+          })),
       }
     })
 
@@ -115,7 +103,8 @@ export function buildConceptTutorModelInput(
       path_node: structuredClone(request.generation_spec.path_node),
       targets: structuredClone(request.generation_spec.targets),
       learner_adaptation: structuredClone(request.generation_spec.learner_adaptation),
-      difficulty: structuredClone(request.generation_spec.difficulty),
+      difficulty: artifactDifficulty(request.generation_spec, "concept_lesson"),
+      ...(request.generation_spec.artifact_tasks ? { artifact_task: structuredClone(request.generation_spec.artifact_tasks.concept_lesson) } : {}),
       policies: structuredClone(request.generation_spec.policies),
     },
     evidence,
@@ -159,40 +148,4 @@ export function buildConceptTutorModelInput(
         : {}),
     },
   }
-}
-
-/**
- * 提取事实的核心词，用于 example / practice task 的引用绑定：
- * 中文用 2 字滑动窗口切出实义片段（中文无空格分词，整段匹配过严），
- * 英文/数字取 >= 3 字符的 token。绑定只用于过滤完全无关的 example，
- * 最终事实正确性仍由下游 fact audit 把关。
- */
-function factContentWords(content: string): string[] {
-  const words: string[] = []
-  words.push(...(content.match(/[a-z0-9_]{3,}/gi) ?? []))
-  const cnRuns = content.match(/[\u4e00-\u9fa5]{2,}/g) ?? []
-  for (const run of cnRuns) {
-    for (let i = 0; i + 2 <= run.length; i += 1) {
-      words.push(run.slice(i, i + 2))
-    }
-  }
-  return words
-}
-
-/**
- * 推断一段 example / practice 文本绑定到哪些 required fact。
- * 只有文本命中某条 fact 的至少一个核心词时才绑定；绑定不上的内容
- * 不进入可信生成（改进方案6 第七节：无引用的旧例子先作候选）。
- */
-function inferFactRefs(
-  text: string,
-  facts: EvidenceFact[],
-): Array<{ source_id: string; fact_id: string }> {
-  return facts
-    .filter((fact) => {
-      const words = factContentWords(fact.content)
-      if (words.length === 0) return false
-      return words.some((word) => text.includes(word))
-    })
-    .map((fact) => ({ source_id: fact.source_id, fact_id: fact.fact_id }))
 }

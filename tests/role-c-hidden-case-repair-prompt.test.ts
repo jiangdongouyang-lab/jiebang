@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { stagedRepairPrompt } from "../src/role-c-content/prompts/staged-repair.prompt"
+import { ASSESSMENT_NOVELTY_REPAIR_SYSTEM_PROMPT } from "../src/role-c-content/prompts/evaluator/staged.prompt"
 
 describe("Role C staged hidden-case repair prompt", () => {
   test("names machine leak codes and requires changed hidden vectors", () => {
@@ -23,5 +24,38 @@ describe("Role C staged hidden-case repair prompt", () => {
     expect(prompt).toContain("完整重写这些下标对应的题目")
     expect(prompt).toContain("repair_directive.required_change_indices")
     expect(prompt).toContain("只换数字、变量名")
+  })
+
+  test("requires args-envelope rewrite for function-mode hidden test inputs", () => {
+    const prompt = stagedRepairPrompt("base", [
+      'code_test_suites[0].hidden_tests[0].input 必须使用 {"args": [...], "kwargs"?: {...}} 调用封装',
+    ])
+    expect(prompt).toContain("调用封装")
+    expect(prompt).toContain('{"args')
+    expect(prompt).toContain("execution_mode 已由编排器冻结为 function")
+    expect(prompt).toContain("input()、sys.stdin")
+    expect(prompt).toContain("按 entry_point 的位置参数顺序")
+    expect(prompt).toContain("不得原样返回 previous_output")
+  })
+
+  test("assessment secure repair replaces leaked cases without changing the function contract", () => {
+    const prompt = stagedRepairPrompt("BASE", ["hidden_test_input_leak"])
+    expect(prompt).toContain("对于 tiered-evaluator.secure")
+    expect(prompt).toContain("code_test_suites[].hidden_tests[].input")
+    expect(prompt).toContain("保留冻结函数签名")
+    expect(prompt).toContain("同步重算 expected")
+  })
+
+  test("assessment secure contract repair removes stdin from function references", () => {
+    const prompt = stagedRepairPrompt("BASE", ["public_secure_code_contract_mismatch"])
+    expect(prompt).toContain("starter_code 函数签名是唯一调用合同")
+    expect(prompt).toContain("不得出现 input()、sys.stdin")
+    expect(prompt).toContain('{"args": [...], "kwargs": {...}}')
+  })
+
+  test("requires form-level repair to follow a distinct task contract", () => {
+    expect(ASSESSMENT_NOVELTY_REPAIR_SYSTEM_PROMPT).toContain("current_form_distinctions")
+    expect(ASSESSMENT_NOVELTY_REPAIR_SYSTEM_PROMPT).toContain("required_task_shape")
+    expect(ASSESSMENT_NOVELTY_REPAIR_SYSTEM_PROMPT).toContain("must_differ_from")
   })
 })

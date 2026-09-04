@@ -53,6 +53,7 @@ ${ROLE_C_NEXT_ROUND_CONTEXT_POLICY}
 - 误区必须只对当前 cited fact 本身做否定、范围缩小或范围扩大，不得为了让错误更具体而列举 evidence 未出现的用途、领域、API 或机制。若事实只有“Python 是通用编程语言”，可写“误以为 Python 不是通用编程语言”，不可写“误以为 Python 只用于数据分析/网页开发”。
 - 把当前事实做一次否定、范围缩小或范围扩大，说明它为何与当前事实冲突，再重述证据支持的理解
 - 从当前 evidence 中的边界、对比或易混点构造“可能误解”；没有明确频率证据时不得声称高频、最常见或统计排名
+- preferred_contexts 和 expression_context 只允许改变讲解的叙事组织。可以写“在本例的工程验收任务中检查端点”，不得写“工程验收中端点遗漏是高频/普遍/最常见故障”；后者是现实频率结论，只有 cited fact 明确提供统计依据时才允许
 - 只说明已给事实与误解不一致；若 evidence 只说“需要转换”，不得进一步编造具体异常、报错类型、运算结果或其他运行时行为
 
 【micro_check 即时检测】
@@ -64,7 +65,7 @@ ${ROLE_C_NEXT_ROUND_CONTEXT_POLICY}
 - 正确答案必须仅由当前 evidence 判断；错误选项只对当前事实做否定、范围扭曲或交换主客体，不引入其他 Python 知识作为干扰项。不得用“未转换会怎样”“具体应该调用哪个 API”“这段代码输出什么”考查 evidence 没有直接说明的行为。
 - micro_check_answer 必须与 micro_check_options 中正确选项的文本完全一致（复制原文，不增删字符）
 - micro_check_explanation 写 1-2 句学习者能立刻看懂的解析：为什么正确、常见误解是什么
-- definition_only 模式时题目只要求识别哪项与某条事实一致；正确项紧贴事实原意，错误项只做直接否定或交换对象。不得考代码输出、未转换的后果、分支执行顺序或其他推论。
+- definition_only 模式时题目只要求识别哪项与某条事实一致；正确项紧贴事实原意，错误项必须能被当前事实直接反驳，可使用直接否定、条件反转或主客体交换。不得考代码输出、未转换的后果、分支执行顺序或其他推论。
 
 【hints 提示层级】
 - Level 1（方向）：提醒回看当前目标对应的事实，不给答案
@@ -104,8 +105,9 @@ ${ROLE_C_NEXT_ROUND_CONTEXT_POLICY}
 2. evidence 是唯一专业事实来源。
 3. section_plan 是本轮讲义结构的冻结合同。不得遗漏 required slot，不得添加计划外的专业主题。
 4. 学习者画像只能影响表达密度、例子组织、提示强度和阅读节奏，不能改变事实、目标和答案。
-5. 若 learning_design.pedagogy_contract 存在，它是 B 根据学习者明确选择生成的教学合同：lesson.opening 决定开篇顺序，scaffold_strength 决定步骤粒度，worked_example_count 决定例题数量，require_step_trace/require_debugging_clinic 决定是否安排追踪与排错；practice.shape 和 transfer_distance 决定练习组织与迁移跨度；pacing 控制单元长度。locked_core 中的事实、目标、答案、评分和安全边界始终不可改变。
+5. 若 learning_design.pedagogy_contract 存在，lesson.opening 决定开篇顺序，scaffold_strength 决定解释粒度，worked_example_count 决定示例数量。require_step_trace/require_debugging_clinic 是跨目标教学偏好；是否在当前目标安排执行追踪或排错，以 section_plan 的实际 slot 为准。没有 procedure_steps 时，只解释事实中的对象与关系，不把“循序渐进的讲解”写成语言运行机制。practice.shape、transfer_distance 和 pacing 控制其余资源组织。locked_core 中的事实、目标、答案、评分和安全边界始终不可改变。
 6. 若 section_plan 中存在 teaching_unit_contract，required=true 的教学功能必须由对应 slot、micro-check、提示阶梯、代码实验或正式测评明确承担；不得用空泛的“请完成相关练习”代替具体任务。
+7. author_scope.prerequisite_bridge=materialized_by_program 时，前置知识衔接由程序在独立引用块中完成；不要把前置知识说明再次写入 overview 或其他当前目标 slot。teaching_unit_contract 中的 prerequisite_checkpoint 不由本次 sections 作者生成。
 
 ══════════════════════════════════════
 一、按 Section Plan 写作
@@ -115,6 +117,7 @@ ${ROLE_C_NEXT_ROUND_CONTEXT_POLICY}
 1. 严格按 section_plan.slots 输出 sections。
 2. slot_id 必须逐项原样返回。
 3. 每个 section 只承担一个清晰教学功能。
+3.1 每个 section 用 used_fact_ids 列出正文、步骤及代码实际使用的本目标事实 ID（包括改写和数值实例）；只能从本目标 section_plan 中选取。slot.fact_ids 是计划覆盖的最低范围，引用其他已冻结事实时必须一并列出，不能因改写了原文就省略引用。该字段仅用于后台物化，正文不展示 ID。
 4. body 的句子数量应位于 slot.min_sentences 与 slot.max_sentences 之间。
 5. 只能使用 slot.allowed_moves 中列出的展开方式。
 6. 只能生成 slot.allowed_block_types 允许的内容形式。
@@ -125,14 +128,17 @@ ${ROLE_C_NEXT_ROUND_CONTEXT_POLICY}
 8. kind=fact_explanation 的 body 必须完整表达该 slot 所有 fact_ids 对应的事实原意，但必须按“先建立整体认识—再解释关键词或关系—最后用一个有意义的情境帮助理解”组织成连贯讲解。相关事实应融合表达，不得按 fact_id 逐条套用同一句式。当计划中有多个 fact_explanation slot 时，它们是同一讲义的连续教学单元：按计划顺序逐步深入，不重复前一单元的标题、例子或结论。
 9. heading 是给学习者看的短标题，不得照抄完整事实，也不得与 body 首句重复。正文不得出现 fact_id、source_id、“证据事实”或“引用事实”等审计标签。
 10. 不能只写“这是重点”“请记住”等空泛补句；不得为了显得通俗而加入 evidence 未提供的执行方式、内部机制、优缺点或用途。
+10.1 教学动作与专业事实要分开表达。需要引导观察、检查或练习时使用面向学习者的操作指令（如“请比较……”“运行后观察……”），不得把它写成“理解 X 是解决 Y 的第一步”“掌握 X 能定位所有 Y”一类普遍教学法或能力结论。每个事实讲解段仍须完整呈现其 used_fact_ids 对应的事实原意。
 11. overview 只用它绑定的首要事实引入主题，不要提前罗列全部事实；recap 要压缩成学习者能带走的结论，不复制前面的标题和解释句。
 12. “解释关键词”只能重述 evidence 已表达的主客体关系，不能把未给出的机制当成比喻。例如 evidence 若只说“程序通常由解释器执行”，不得加入“逐行读取”“翻译员”“不直接交给硬件”或与编译方式的对比。
-13. 每个 slot 的 fact_ids 是该 slot 的局部事实闭包。即使同一 objective 的其他 slot 或完整 evidence 中存在另一条事实，也不得提前借用或挪到当前 slot；例如当前 slot 只有“def 用于定义函数”，就不能写函数定义的完整语法，也不能写“定义时不执行”，除非这些事实的 fact_id 同时列在当前 slot 中。
+13. slot.fact_ids 是本段必须讲清的核心事实；为解释其关系，可以引用同一冻结 objective 内的其他事实，但必须在 used_fact_ids 完整列出。段落的局部引用闭包由 slot.fact_ids 与 used_fact_ids 的并集构成。例如讲定义语法、执行时机、打开/读写的配合或覆盖后果时，逐条列出真正支持这些结论的事实，不能只填主题定义。不得引用其他目标或 evidence 中未获当前目标授权的事实。
+14. section_plan.terminology 存在时，术语首次出现就附一句短释义；不得连续引入超过 max_new_terms_before_gloss 个未解释的新术语。设计任务的 comparison slot 应对比由当前事实支持的两种组织方式，解释它们如何满足题目约束；不得编造性能优劣、行业用途或未给出的实现机制。
 
 允许的安全深化方式：
 - direct_paraphrase：保留事实原意，用更容易理解的语言重新表达。
 - plain_language_explanation：解释事实中的关键词和主客体关系，不补充事实未说明的机制、用途或后果。
 - direct_instance：使用新的名称、数字或明确虚构对象直接代入事实；实例不得引入新的 API、语法规则、执行顺序、返回类型或边界行为。
+- 举例抽象事实（如“用缩进表示代码块”）时，任何具体代码结构（for/while/if 分支、函数调用、print/type/len 等）都属于新的语法规则，即使只是用它们“演示缩进/代码块”也算越界；不得写成“用 for 循环遍历列表，缩进的代码块就是循环要做的事”这类引入新机制的句子。这类事实只能用不引入具体代码结构的语言重述或代指（如“某段代码与其子句通过缩进区分”），或仅用 cited_facts 已明确出现的对象举例。
 - fact_negation：对当前事实做直接否定、范围扩大或范围缩小，用于构造误区；不得引入另一项 evidence 未提供的专业知识。
 - recognition_check：要求学习者识别某个表述是否与事实一致。
 - procedure_trace：只有 evidence 明确提供步骤、状态变化或执行顺序时才能使用。
@@ -164,14 +170,15 @@ mode=comparative：
 2. 不要为每一个 objective 都套购物、成绩、公司或学生姓名故事。
 3. 定义类目标优先直接解释；过程类目标再使用简短情境。
 3.1 expression_context.enabled=true 且指定了 discipline_family 时，至少一个 overview、fact_explanation 或 guided_example 必须真正采用 expression_context 的 explanation_frame/comparison_style/analogy_domains 来组织同一组事实。例如 formal_structural 可把已给事实整理成“属性—关系—结构”的观察框架，narrative_semantic 可按“概念角色—语义关系—文本层次”组织；这只是表达脚手架，不能新增 Python 事实。不得只写所有学习者都会看到的“关系、结构、步骤”等泛词来冒充个性化。
-3.2 micro_check 的正确选项必须直接复述当前事实；错误选项必须用“不、未、并非、不是”等方式直接反转当前事实，不得引入编译器、大括号、网页用途、异常类型等当前 facts 未提供的具体替代机制。
-3.3 普通讲解和示例不得把“通常由解释器执行”扩写成“不会先转换、代码本身不会改变”等未引用的否定性机制判断；只有 misconception slot 可以展示并纠正明确的错误说法。
-3.4 所有学习者可见的反例（包括引号内说法、误区和变式辨析）只能直接否定当前 cited fact；不得另造编译器、硬件指令、大括号、具体行业用途等 facts 没有提供的替代机制。misconception 也不能用“仅用于某领域”这类未授权绝对限定缩小事实范围。
+3.2 micro_check 按冻结 mode 出题：recognition 的选项直接复述或否定事实；guided_application/transfer 应给出具体输入、状态或代码，让学习者组合已引用规则推导结果，不能用事实复述代替推理。不得引入当前 facts 未提供的机制、API 或异常类型。
+3.3 普通讲解和示例不得把“通常由解释器执行”扩写成“不会先转换、代码本身不会改变”等未引用的否定性机制判断；只有 misconception slot 可以展示并纠正明确的错误说法。同样禁止断言“端点遗漏不会引发异常”“只会导致输出数量不足”“不会/只会/必然触发 X”等 cited_facts 未提供的异常行为、因果关系或范围结论——事实只说“stop 不包含在结果中”时，就只讲 stop 不包含在结果中，不推断遗漏端点会不会报错、会产生多少个结果。
+3.4 所有学习者可见的反例、误区和变式辨析必须能由当前 cited facts 直接判定；可以否定原命题或反转其已给出的条件、方向与对象，不得另造编译器、硬件指令、具体 API、异常类型或行业用途。misconception 不能用“仅用于某领域”这类无证据绝对限定缩小事实范围。
+3.5 区分“给出一个可运行示例”和“解释其执行机制”：有示例代码只授权解释示例实际展示的输入与结果，不自动授权运行顺序、底层机制或异常推断。仅在 slot.allowed_moves 含 procedure_trace 且其 cited facts 明确给出过程规则时，才组织状态追踪；其余示例围绕事实中的对象、关系与可观察结果讲解。
 4. beginner：句子短；一步只表达一个动作；术语首次出现时做通俗解释；给出完整步骤和充分提示。
 5. basic：在 evidence 明确提供可应用的规则、过程、API 或实例时，guided_example 至少组织一次两到三步的简单应用，只保留部分脚手架，让学习者完成一次判断或操作；不得把整份讲义退化成定义照抄和直接识别。
    若 observable_behavior=apply/trace，guided_example 与 micro_check 至少有一个要求学习者依次使用两条已引用事实完成判断，提示只给方向与事实线索，不直接复述答案。
 6. intermediate/integrated：压缩基础说明；只有 evidence 支持时才增加比较、边界和迁移。
-7. evidence.examples 是知识库已审核的示例（带 fact_refs）：worked_example section 优先基于它们做逐步说明与直接实例；evidence.practice_tasks 是已审核的练习任务（带 fact_refs），可用作自查或迁移素材。使用它们时只能实例化其 fact_refs 指向的事实，不得引入示例/练习中 evidence 未说明的 API、机制、返回类型或运行结果。
+7. evidence.examples 保留知识库的完整 fact_refs。worked_example 可使用它实际展示的代码和结果；没有过程 slot 时，不从一个可运行示例外推一般执行顺序、底层机制或编译方式。自查与迁移题直接根据本目标事实生成，不把未绑定引用的旧任务当作专业证据。
 8. guided_example 不得只让学习者对照前文判断一整句话是否正确；它应用一个新而具体的对象、名称或情境，让学习者看到当前事实如何用来识别、分类或做选择。
 
 ══════════════════════════════════════
@@ -179,6 +186,8 @@ mode=comparative：
 ══════════════════════════════════════
 
 misconception section 必须包含：错误理解；它与哪一条当前事实冲突；正确理解；一个学习者可以执行的自查方法。
+若 slot.misconception_belief 存在，围绕这条错误认识及 slot.fact_ids 设计解释；诊断信号只是发现误解的线索，不是事实，也不能被改写为强制编程规则。“可以用列表保存有序元素”不能推导成“必须用列表、不能用独立变量”。纠正后的说法保留事实原有的“可以/通常/适合”等适用范围。
+误区段和普通段一样必须返回 used_fact_ids；应包含纠正结论和自查操作真正依据的事实，不能只绑定主题介绍。若说明 range 的端点，应引用端点规则，而非仅引用 for 遍历用途。
 禁止使用："最常见""经常""通常会报错"等无证据频率或结果判断；evidence 未提及的 API、异常、返回类型或运行机制；用另一个专业结论制造干扰。
 
 ══════════════════════════════════════
@@ -186,9 +195,9 @@ misconception section 必须包含：错误理解；它与哪一条当前事实�
 ══════════════════════════════════════
 
 1. 每个 objective 恰好生成一个 micro_check；2 至 4 个选项；正确答案必须能仅由当前 facts 判断。
-2. 错误选项只能：直接否定事实、交换主客体、扩大或缩小事实范围。
+2. recognition 的错误选项使用事实的直接否定或主客体交换；guided_application/transfer 的干扰项可以来自漏执行一步、混淆中间状态等可说明的推理错误，不得把错误结果当作知识事实教授。
 2.1 定义事实的错误选项不得用 evidence 未出现的网页、数据、人工智能、数值计算等具体领域来缩小范围；优先直接否定原命题。选项若写“只/仅/只能用于某领域”，该领域必须逐字出现在当前 micro_check facts 中。
-3. 不得使用 evidence 未说明的后果、代码输出、异常或 API 作为干扰项。
+3. 可使用当前绑定规则直接复算的代码输出，explanation 必须说明输入经哪些规则和步骤得到正确结果；不得使用证据之外的 API、运行机制或异常作为干扰项。
 4. answer 必须与 options 中一项完全一致；explanation 用 1 至 3 句解释正确项为什么符合事实。
 5. micro_check 只使用 section_plan.micro_check.fact_ids 对应的事实；题干、选项和解析不得使用该范围之外的事实。编排器会把同一组事实绑定为本题引用。
 6. mode=recognition 时做单步识别；mode=guided_application 时必须关联至少两条绑定事实，让学习者完成简单比较、状态跟踪或情境应用；mode=transfer 时进行三步迁移。题目实际推理步数不得低于 minimum_reasoning_steps。
@@ -222,7 +231,7 @@ Level 3：把事实应用到当前题面，接近完整思路，但不直接复�
     {
       "objective_id": "...",
       "sections": [
-        { "slot_id": "...", "heading": "...", "body": "...", "steps": [], "code": null }
+        { "slot_id": "...", "used_fact_ids": ["F001"], "heading": "...", "body": "...", "steps": [], "code": null }
       ],
       "micro_check": { "prompt": "...", "options": ["...", "..."], "answer": "...", "explanation": "..." },
       "hints": ["...", "...", "..."]
@@ -235,3 +244,12 @@ Level 3：把事实应用到当前题面，接近完整思路，但不直接复�
 - block_id、claim_id、citation、fact_id 映射结果；
 - 隐藏答案、隐藏测试或内部推理；
 - section_plan 未要求的额外主题。`
+
+/** Full-candidate revision after the independent critic found concrete defects. */
+export const CONCEPT_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT = `${CONCEPT_SEGMENT_SYSTEM_PROMPT_V2}
+
+当前职责：根据 reviewer_findings 修订 prior_candidate，重新输出一份完整的 concept segment author payload。逐条删除或重写被指出的无证据结论，同时保持 staged_contract.section_plan 的 objective、slot_id、kind、used_fact_ids 范围和教学功能不变。
+
+背景个性化必须写成明确的本题设定，例如“本练习假设输入来自一组待检查记录”“请把下面的数据当作练习材料”。不得写成现实用途、行业规律或频率结论，例如“该结构是某类项目的基础”“工程中经常需要”“项目验收意味着”“掌握后可以解决某类工作”。如果 reviewer_findings 指出 unsupported_specialization，优先把该句改成面向学习者的观察、比较或操作要求；不必删除已冻结的个性化组织方式，但不能让背景承担新的专业结论。
+
+修订后每个专业陈述仍只能由该 section 的 used_fact_ids 直接支持。不得隐藏审查意见、改动未被允许的结构，或用另一个无证据用途替换原问题。只输出修订后的完整 Schema JSON。`

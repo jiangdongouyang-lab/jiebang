@@ -580,6 +580,26 @@ describe("quality kernel v2", () => {
     expect(issues.map((entry) => entry.code)).toContain("ASSESSMENT_UNCITED_MECHANISM")
   })
 
+  test("单题只引用执行方式时不能借用同知识点未引用的语言类别事实", () => {
+    const issues = validateAssessmentAuthorEvidenceDiscipline({
+      title: "Python 基础",
+      items: [{
+        prompt: "判断以下说法是否正确：Python 不是一种通用编程语言。",
+        options: ["正确", "错误"],
+        starter_code: null,
+        structure_meta: { operation: "judge_explicitly_negated_claim" },
+      }],
+    } as any, [{
+      tier: 1,
+      modality: "true_false",
+      citations: [{ source_id: "K001", fact_id: "F002", relation: "derived_from" }],
+    }] as any, [
+      { source_id: "K001", fact_id: "F001", content: "Python 是一种通用编程语言。" },
+      { source_id: "K001", fact_id: "F002", content: "Python 程序通常由解释器执行。" },
+    ])
+    expect(issues.map((entry) => entry.code)).toContain("ASSESSMENT_UNCITED_FACT_RELATION")
+  })
+
   test("选择题拒绝选否定项的双重反转题干", () => {
     const issues = validateAssessmentAuthorEvidenceDiscipline({
       title: "Python 语法",
@@ -622,6 +642,39 @@ describe("quality kernel v2", () => {
       minimum_score: 0.5,
     })
     expect(evaluation.dimensions.find((entry) => entry.dimension === "distractor_quality")?.applicable).toBe(false)
+    expect(evaluation.critical_findings).not.toContain("CORE_QUALITY_DIMENSION_LOW")
+  })
+
+  test("debugging starter is scored as a runnable faulty program rather than an incomplete implementation", () => {
+    const design = buildLearningDesignSpecV2({
+      spec: {
+        spec_id: "S-DEBUG-STARTER",
+        profile_ref: { profile_id: "P", profile_version: "1" },
+        learner_adaptation: { level: "basic", known_concepts: [], weak_concepts: [], scaffold_level: 2 },
+        targets: [{ objective_id: "O", source_id: "K", required_fact_ids: ["F"], observable_behavior: "debug" }],
+      } as any,
+      evidence: { results: [{ source_id: "K", title: "循环边界" }] } as any,
+      assessment_plan: [],
+    })
+    const evaluation = evaluatePublicAuthorCandidate({
+      candidate_id: "DEBUG-STARTER",
+      artifact_kind: "code_lab",
+      payload: {
+        starter_code: "for index in range(3):\n    print(index + 1)",
+        programming_task: { task_kind: "debugging_repair" },
+        objectives: [{
+          instruction_text: "运行程序并定位编号边界错误",
+          public_test: { input: "", expected_behavior: "输出 0、1、2" },
+          hints: ["观察首项", "追踪 index", "核对边界"],
+          reflection_question: "哪一个公开输出暴露了边界问题？",
+        }],
+      },
+      learning_design: design,
+      code_lab_task_kind: "debugging_repair",
+      minimum_score: 0.5,
+    })
+    expect(evaluation.dimensions.find((entry) => entry.dimension === "starter_scaffolding"))
+      .toMatchObject({ score: 1, core: true })
     expect(evaluation.critical_findings).not.toContain("CORE_QUALITY_DIMENSION_LOW")
   })
 
@@ -746,5 +799,63 @@ describe("quality kernel v2", () => {
     expect(secure.mutation_variants.map((entry) => entry.misconception_tag)).toEqual([
       "MIS-RANGE-STOP", "MIS-WRONG-ACCUMULATOR",
     ])
+  })
+})
+
+describe("candidate critic score coercion (glm-5.2 json_object soft schema)", () => {
+  const base = {
+    candidate_id: "C-STR",
+    artifact_kind: "concept_lesson",
+    hard_gates: [],
+    dimensions: [{ dimension: "objective_alignment", score: 0.9, weight: 1, confidence: 0.8, evidence_refs: ["O1"], rationale: "covered", core: true }],
+    overall_score: 0.9,
+    release_eligible: true,
+    critical_findings: [],
+  } as any
+
+  test("accepts string-number scores and normalizes them instead of throwing SCORE_INVALID", async () => {
+    const reviewed = await reviewPublicCandidatesWithModel({
+      gateway: {
+        model_id: "glm-5.2",
+        model_config_hash: "sha256:test",
+        generateStructured: async () => ({
+          results: [{
+            candidate_index: 0,
+            groundedness: "0.85",
+            correctness: "0.8",
+            instructional_value: "70",
+            critical_issues: [],
+          }],
+        }),
+      } as any,
+      task: "test.candidate",
+      artifact_kind: "concept_lesson",
+      candidates: [{ candidate: { text: "x" }, variant_index: 0, evaluation: base }],
+      evidence: [{ fact_id: "F1", content: "已知事实" }],
+      contract: { objective_id: "O1" },
+    })
+    expect(reviewed[0]?.release_eligible).toBe(true)
+    const dims = reviewed[0]!.dimensions
+    const groundedness = dims.find((d) => d.dimension === "semantic_groundedness")!.score
+    const instructional = dims.find((d) => d.dimension === "instructional_value")!.score
+    expect(groundedness).toBeCloseTo(0.85)
+    expect(instructional).toBeCloseTo(0.7) // "70" percent → 0.7
+  })
+
+  test("still rejects null/object scores", async () => {
+    await expect(reviewPublicCandidatesWithModel({
+      gateway: {
+        model_id: "glm-5.2",
+        model_config_hash: "sha256:test",
+        generateStructured: async () => ({
+          results: [{ candidate_index: 0, groundedness: null, correctness: 0.8, instructional_value: 0.7, critical_issues: [] }],
+        }),
+      } as any,
+      task: "test.candidate",
+      artifact_kind: "concept_lesson",
+      candidates: [{ candidate: { text: "x" }, variant_index: 0, evaluation: base }],
+      evidence: [{ fact_id: "F1", content: "已知事实" }],
+      contract: { objective_id: "O1" },
+    })).rejects.toThrow("ROLE_C_CANDIDATE_CRITIC_RESULT_SCORE_INVALID")
   })
 })

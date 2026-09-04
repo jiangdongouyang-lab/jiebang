@@ -14,6 +14,7 @@ export {
   STAGED_AUTHOR_PROMPT_VERSION,
   CONCEPT_SEGMENT_SYSTEM_PROMPT,
   CONCEPT_SEGMENT_SYSTEM_PROMPT_V2,
+  CONCEPT_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT,
 } from "./concept-tutor/staged.prompt"
 
 // ── Code Lab（代码实验） ──
@@ -22,7 +23,10 @@ export {
   CODE_LAB_SYSTEM_PROMPT,
 } from "./code-lab/system.prompt"
 export { codeLabRepairPrompt } from "./code-lab/repair.prompt"
-export { CODE_LAB_PUBLIC_STAGE_SYSTEM_PROMPT } from "./code-lab/public-stage.prompt"
+export {
+  CODE_LAB_PUBLIC_STAGE_SYSTEM_PROMPT,
+  CODE_LAB_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT,
+} from "./code-lab/public-stage.prompt"
 export { CODE_LAB_SECURE_STAGE_SYSTEM_PROMPT } from "./code-lab/secure-stage.prompt"
 export { CODE_LAB_REFERENCE_STAGE_SYSTEM_PROMPT } from "./code-lab/reference-stage.prompt"
 export { CODE_LAB_TEST_INPUT_STAGE_SYSTEM_PROMPT } from "./code-lab/test-input-stage.prompt"

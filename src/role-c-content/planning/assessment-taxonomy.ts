@@ -102,10 +102,8 @@ export function validateAssessmentTaxonomyPlan(
       issues.push(`${item.item_id} 的 Tier 3 construct_solution 必须为 create`)
     }
   }
-  if (items.length >= 3) {
-    if (new Set(plan.entries.map((entry) => entry.difficulty_band)).size < 2) issues.push("三题及以上至少包含两个难度层级")
-    if (new Set(plan.entries.map((entry) => entry.cognitive_level)).size < 2) issues.push("三题及以上至少包含两个认知层次")
-  }
+  // Distribution describes the frozen item plan. A uniform foundation set is
+  // valid; item count alone cannot justify inventing a second difficulty band.
   return issues
 }
 
@@ -113,19 +111,17 @@ function chooseCognitiveLevel(
   item: AssessmentTaxonomyInputItem,
   emphasis: { recall: number; understanding: number; application: number; analysis: number; creation: number },
 ): AssessmentCognitiveLevel {
+  if (item.cognitive_operation === "diagnose_error") return "analyze"
   const feasible = item.tier === 1
     ? (["remember", "understand"] as const)
     : item.cognitive_operation === "recognize_fact" || item.cognitive_operation === "explain_reasoning"
       ? (["understand", ...(item.tier === 3 ? ["analyze" as const] : [])] as const)
       : item.cognitive_operation === "trace_execution" || item.cognitive_operation === "apply_rule"
         ? (["apply", ...(item.tier === 3 ? ["analyze" as const] : [])] as const)
-        : item.cognitive_operation === "diagnose_error"
-          ? (["analyze"] as const)
-          : item.tier === 3 ? (["create"] as const) : (["apply", "analyze"] as const)
+        : item.tier === 3 ? (["create"] as const) : (["apply", "analyze"] as const)
   const native: AssessmentCognitiveLevel = item.tier === 1
     ? item.cognitive_operation === "recognize_fact" ? "remember" : "understand"
-    : item.cognitive_operation === "diagnose_error" ? "analyze"
-      : item.cognitive_operation === "construct_solution" && item.tier === 3 ? "create"
+    : item.cognitive_operation === "construct_solution" && item.tier === 3 ? "create"
         : item.cognitive_operation === "trace_execution" || item.cognitive_operation === "apply_rule" ? "apply" : "understand"
   const weights: Record<AssessmentCognitiveLevel, number> = {
     remember: emphasis.recall, understand: emphasis.understanding, apply: emphasis.application,

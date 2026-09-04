@@ -200,7 +200,7 @@ export function buildResourceBlueprint(
     throw new Error("RESOURCE_BLUEPRINT_EVIDENCE_IDENTITY_MISMATCH")
   }
   const identity = buildLabIdentity(spec)
-  const taskContract = decideCodeLabTaskContract(spec, evidence)
+  const taskContract = parameterizeArtifactTask(decideCodeLabTaskContract(spec, evidence), spec.artifact_tasks?.code_lab.lab)
   const codeObjectivePlan = buildCodeLabObjectivePlan(spec, evidence, taskContract)
   const misconceptionIdsByObjective = Object.fromEntries(spec.targets.map((target) => {
     const evidenceItem = evidence.results.find((item) => item.source_id === target.source_id)
@@ -246,7 +246,13 @@ export function buildResourceBlueprint(
     entry.source_id === primaryTarget.source_id)
   const goalProfile = spec.personalization_policy?.goal_profile ?? "general_learning"
   const learnerLevel = spec.learner_adaptation.level ?? evidence.learner_level ?? "basic"
-  const preferredProgrammingKind = taskContract.learner_action === "recall_fact"
+  const preferredProgrammingKind = spec.artifact_tasks?.code_lab.lab?.require_faulty_starter
+    ? "debugging_repair" as const
+    : spec.artifact_tasks?.code_lab.behavior === "create"
+      ? (taskContract.execution_mode === "function" ? "function_implementation" as const : "stdin_stdout_program" as const)
+    : spec.artifact_tasks
+      ? "code_completion" as const
+    : taskContract.learner_action === "recall_fact"
     ? "code_completion" as const
     : selectProgrammingTaskKind(goalProfile, learnerLevel, primarySkill.progress_band)
   const programmingProblem = buildProgrammingProblemBlueprint({
@@ -267,6 +273,14 @@ export function buildResourceBlueprint(
     learner_owned_behavior: primaryTarget.observable_behavior,
     execution_contract: plannedProgrammingExecutionContract(taskContract),
   })
+  const labTask = spec.artifact_tasks?.code_lab.lab
+  if (labTask) {
+    programmingProblem.public_case_count = Math.max(programmingProblem.public_case_count, labTask.public_test_minimum)
+    const boundary = programmingProblem.test_partitions.find(p => p.kind === "boundary")
+    if (boundary) boundary.minimum_cases = Math.max(boundary.minimum_cases, labTask.boundary_case_minimum)
+    programmingProblem.hidden_case_count = Math.max(programmingProblem.hidden_case_count, labTask.hidden_test_minimum, spec.targets.length, programmingProblem.test_partitions.reduce((n,p) => n+p.minimum_cases,0))
+    programmingProblem.blueprint_id = stableId("PROGRAMMING", programmingProblem)
+  }
   const codeSecurePlan = buildCodeLabSecurePlan(
     spec,
     identity.test_suite_id,
@@ -455,7 +469,18 @@ export function buildDifficultyPlan(
 ): ResourceDifficultyPlan {
   const difficulty = spec.difficulty
     ?? adaptationDefaults(spec.learner_adaptation?.level ?? "basic").difficulty
-  const { challenge, support } = splitDifficultyVector(difficulty)
+  // artifact_tasks may carry resource-specific challenge vectors, but they do
+  // not replace the semantic rules of each resource: lessons remain guided,
+  // labs expose optional scaffolding, and formal assessments remain unhinted.
+  const conceptBase = splitDifficultyVector(
+    spec.artifact_tasks?.concept_lesson.difficulty_vector ?? difficulty,
+  )
+  const codeLabBase = splitDifficultyVector(
+    spec.artifact_tasks?.code_lab.difficulty_vector ?? difficulty,
+  )
+  const assessmentBase = splitDifficultyVector(
+    spec.artifact_tasks?.assessment.difficulty_vector ?? difficulty,
+  )
   const learnerLevel = spec.learner_adaptation?.level ?? "basic"
   const assessmentBlueprint = spec.assessment_blueprint
   const plannedPrerequisiteLoad = spec.path_node?.prerequisite_source_ids?.length ?? 0
@@ -464,66 +489,73 @@ export function buildDifficultyPlan(
     assessmentBlueprint,
     spec.learner_adaptation?.preferred_contexts ?? [],
   )
+  const hasAssessmentPlan = Boolean(options.assessment_plan?.length || assessmentBlueprint)
 
   const concept: ResourceDifficultyPlanEntry = {
     challenge_target: {
-      ...challenge,
+      ...conceptBase.challenge,
       // 讲义降低阅读密度与表达坡度，但不能把学习目标本身降一档。
       // basic 学习者仍需在讲义中完成简单应用，而不是被重新测成纯识记。
-      cognitive_demand: clamp5(Math.max(1, challenge.cognitive_demand)),
-      reasoning_steps: clamp5(Math.max(1, challenge.reasoning_steps)),
-      code_complexity: clamp5(challenge.code_complexity - 1),
+      cognitive_demand: clamp5(Math.max(1, conceptBase.challenge.cognitive_demand)),
+      reasoning_steps: clamp5(Math.max(1, conceptBase.challenge.reasoning_steps)),
+      code_complexity: clamp5(conceptBase.challenge.code_complexity - 1),
       prerequisite_load: clamp5(Math.max(
-        challenge.prerequisite_load,
+        conceptBase.challenge.prerequisite_load,
         plannedPrerequisiteLoad,
       )),
-      ...(challenge.transfer_distance !== undefined
-        ? { transfer_distance: clamp5(challenge.transfer_distance - 1) }
+      ...(conceptBase.challenge.transfer_distance !== undefined
+        ? { transfer_distance: clamp5(conceptBase.challenge.transfer_distance - 1) }
         : {}),
     },
     support_target: {
-      scaffold_strength: clamp5(support.scaffold_strength + 1),
+      scaffold_strength: clamp5(conceptBase.support.scaffold_strength + 1),
       reading_density: "low",
-      hint_strength: clamp5(support.hint_strength + 1),
+      hint_strength: clamp5(conceptBase.support.hint_strength + 1),
       starter_support: 0,
     },
   }
 
   const codeLab: ResourceDifficultyPlanEntry = {
     challenge_target: {
-      ...challenge,
-      reasoning_steps: clamp5(challenge.reasoning_steps + 0.5),
-      code_complexity: clamp5(Math.max(challenge.code_complexity, 1)),
+      ...codeLabBase.challenge,
+      reasoning_steps: clamp5(codeLabBase.challenge.reasoning_steps + 0.5),
+      code_complexity: clamp5(Math.max(codeLabBase.challenge.code_complexity, 1)),
+      prerequisite_load: clamp5(Math.max(
+        codeLabBase.challenge.prerequisite_load,
+        plannedPrerequisiteLoad,
+      )),
     },
     support_target: {
-      scaffold_strength: clamp5(support.scaffold_strength),
-      reading_density: support.reading_density,
+      scaffold_strength: clamp5(codeLabBase.support.scaffold_strength),
+      reading_density: codeLabBase.support.reading_density,
       hint_strength: clamp5(Math.max(
-        support.hint_strength,
+        codeLabBase.support.hint_strength,
         learnerLevel === "beginner" ? 3 : learnerLevel === "basic" ? 2 : 1,
       )),
-      starter_support: clamp5(Math.max(
-        support.starter_support,
-        learnerLevel === "beginner" ? 3 : learnerLevel === "basic" ? 2 : 1,
-      )),
+      starter_support: spec.artifact_tasks?.code_lab.lab
+        ? clamp5(spec.artifact_tasks.code_lab.lab.starter_completion_ratio_ceiling * 5)
+        : clamp5(Math.max(
+            codeLabBase.support.starter_support,
+            learnerLevel === "beginner" ? 3 : learnerLevel === "basic" ? 2 : 1,
+          )),
     },
   }
 
   const assessment: ResourceDifficultyPlanEntry = {
     challenge_target: {
-      ...challenge,
-      cognitive_demand: clamp5(Math.max(
-        challenge.cognitive_demand,
-        assessmentChallenge.cognitive_demand,
-      )),
-      reasoning_steps: clamp5(Math.max(
-        challenge.reasoning_steps,
-        assessmentChallenge.reasoning_steps,
-      )),
-      transfer_distance: clamp5(Math.max(
-        challenge.transfer_distance ?? 0,
-        assessmentChallenge.transfer_distance,
-      )),
+      ...assessmentBase.challenge,
+      // These three dimensions are owned by the actual item plan.  Taking the
+      // maximum with a generic learner vector asks the author for work that the
+      // frozen assessment plan may not contain, then penalizes the result.
+      cognitive_demand: clamp5(hasAssessmentPlan
+        ? assessmentChallenge.cognitive_demand
+        : assessmentBase.challenge.cognitive_demand),
+      reasoning_steps: clamp5(hasAssessmentPlan
+        ? assessmentChallenge.reasoning_steps
+        : assessmentBase.challenge.reasoning_steps),
+      transfer_distance: clamp5(hasAssessmentPlan
+        ? assessmentChallenge.transfer_distance
+        : (assessmentBase.challenge.transfer_distance ?? 0)),
     },
     support_target: {
       scaffold_strength: 0,
@@ -829,6 +861,21 @@ function decideCodeLabTaskContract(
   }
 }
 
+/** A varied test plan requires variable inputs, even when I/O is not the taught topic. */
+export function parameterizeArtifactTask(
+  task: CodeLabTaskContract,
+  lab: import("../contracts/artifact-task").ArtifactTaskContractV2["lab"],
+): CodeLabTaskContract {
+  if (!lab || task.input_form !== "none" || Math.max(lab.public_test_minimum, lab.hidden_test_minimum) <= 1) return task
+  return {
+    ...task,
+    task_kind: "callable_function", learner_action: "implement_function", learner_owned_region: "function_body",
+    execution_mode: "function", program_entry: "平台向 solve 函数传入任务数据；函数签名与非目标胶水由 starter 提供",
+    input_form: "function_arguments", stdin_layout: "none", output_form: "return_value", grading_invocation: "call_entry_function", entry_point: "solve",
+    output_constraint: "判题器向 solve 传入不同参数并比较返回值；starter 提供函数外壳与旁支胶水，只由学习者完成冻结目标对应的核心操作",
+  }
+}
+
 function plannedProgrammingExecutionContract(task: CodeLabTaskContract) {
   return {
     language: "python" as const,
@@ -840,7 +887,9 @@ function plannedProgrammingExecutionContract(task: CodeLabTaskContract) {
       constraints: [task.program_entry],
     },
     output_contract: {
-      kind: task.execution_mode === "stdin_stdout" ? "string" as const : "object" as const,
+      // Function ABI does not imply a dictionary result. The public task author
+      // defines the concrete return type together with the task, then freezes it.
+      ...(task.execution_mode === "stdin_stdout" ? { kind: "string" as const } : {}),
       type: task.output_form,
       constraints: [task.output_constraint],
     },

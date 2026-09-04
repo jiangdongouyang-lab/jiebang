@@ -13,7 +13,10 @@ import { ModelBackedRoleCContentProvider } from "../src/role-c-content/providers
 import { validateConceptLesson } from "../src/role-c-content/validators/concept-validator"
 import type { ConceptTutorRequest } from "../src/role-c-content/agents/types"
 import type { ModelGateway, StructuredModelRequest } from "../src/role-c-content/contracts/model-gateway"
-import { ROLE_C_PROMPT_MANIFEST_VERSION } from "../src/role-c-content/prompts"
+import {
+  CONCEPT_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT,
+  ROLE_C_PROMPT_MANIFEST_VERSION,
+} from "../src/role-c-content/prompts"
 
 function segmentRequest(targets: Array<{ objective_id: string; source_id: string; fact_ids: string[]; behavior: string }>, facts: Array<{ source_id: string; fact_id: string; content: string; capabilities?: string[] }>): ConceptTutorRequest {
   return {
@@ -81,6 +84,90 @@ const payloadV2 = {
 }
 
 describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
+  test("概念候选复审把个性化背景改为练习设定而非行业结论", () => {
+    expect(CONCEPT_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT).toContain("本题设定")
+    expect(CONCEPT_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT).toContain("unsupported_specialization")
+    expect(CONCEPT_PUBLIC_REVIEW_REVISION_SYSTEM_PROMPT).toContain("不得写成现实用途、行业规律或频率结论")
+  })
+  test("即时检查与三级提示保留完整的应用事实闭包，不在物化前截成四条", () => {
+    const contents = ["列表保存有序元素。", "元素通过索引访问。", "append 向末尾添加元素。", "方括号创建列表。", "索引从 0 开始。", "列表可变。", "越界引发 IndexError。"]
+    for (const behavior of ["apply", "create"]) {
+      const facts = contents.map((content, i) => ({ source_id: "K009", fact_id: `F00${i + 1}`, content }))
+      const request = segmentRequest([{ objective_id: "O1", source_id: "K009", fact_ids: facts.map(f => f.fact_id), behavior }], facts)
+      const plans = buildConceptSectionPlansForSegment(request)
+      expect(new Set(plans[0]!.micro_check.fact_ids)).toEqual(new Set(facts.map(f => f.fact_id)))
+      const payload = structuredClone(payloadV2) as any
+      payload.objectives[0].sections = plans[0]!.slots.map(s => ({ slot_id: s.slot_id, used_fact_ids: s.fact_ids, heading: "列表操作", body: "比较列表变化。检查元素。", steps: [], code: null }))
+      const lesson = materializeConceptSegmentV2(request, payload, plans)
+      expect(new Set(lesson.micro_checks[0]!.citations.map(c => c.fact_id))).toEqual(new Set(facts.map(f => f.fact_id)))
+      for (const hint of lesson.hint_ladders[0]!.hints) expect(new Set(hint.citations.map(c => c.fact_id))).toEqual(new Set(facts.map(f => f.fact_id)))
+    }
+  })
+  test("代码不经过文案清理：保留嵌套缩进、字符串内空格和词语", () => {
+    const request = segmentRequest(
+      [{ objective_id: "O1", source_id: "K007", fact_ids: ["F001"], behavior: "trace" }],
+      [{ source_id: "K007", fact_id: "F001", content: "for 可遍历序列。" }],
+    )
+    const plans = buildConceptSectionPlansForSegment(request)
+    const code = 'for row in [["RAG  example"]]:\n    for value in row:\n        print(value)'
+    const payload = structuredClone(payloadV2) as any
+    payload.objectives[0].sections = plans[0]!.slots.map(slot => ({
+      slot_id: slot.slot_id, used_fact_ids: slot.fact_ids, heading: "遍历",
+      body: "for 可遍历序列。依次处理其中的元素。", steps: [], code,
+    }))
+    const normalized = anchorConceptFactsInVisibleText({ payload, request, plans })
+    const executable = normalized.objectives[0]!.sections.find((section: any) => section.code)
+    expect(executable?.code).toBe(code)
+    expect(normalized.objectives[0]!.sections.filter((section: any) => !plans[0]!.slots.find((slot) => slot.slot_id === section.slot_id)!.allowed_block_types.includes("code")).every((section: any) => section.code === null)).toBe(true)
+    const run = Bun.spawnSync(["python3", "-c", executable!.code!])
+    expect(run.exitCode).toBe(0)
+    expect(run.stdout.toString()).toBe("RAG  example\n")
+  })
+  test("误区按完整纠错事实规划，不能只绑定首条主题事实或半条误区证据", () => {
+    const request = segmentRequest(
+      [{ objective_id: "O1", source_id: "K007", fact_ids: ["F001", "F005"], behavior: "trace" }],
+      [{ source_id: "K007", fact_id: "F001", content: "for 可遍历序列。" },
+        { source_id: "K007", fact_id: "F005", content: "range 不包含结束值。" }],
+    )
+    request.evidence_pack.results[0]!.misconceptions = [{
+      misconceptionId: "M1", incorrectBelief: "range 包含结束值。", diagnosticSignals: [],
+      counterexample: "range(3) 为 0、1、2。", correctionStrategy: "检查结束边界。", distractorTemplates: [],
+      factRefs: [{ sourceId: "K007", factId: "F005" }],
+    }]
+    const plans = buildConceptSectionPlansForSegment(request)
+    const slot = plans[0]!.slots.find(s => s.kind === "misconception")!
+    expect(slot.fact_ids).toEqual(["F005"])
+    expect(slot.misconception_belief).toBe("range 包含结束值。")
+    const payload = structuredClone(payloadV2) as any
+    payload.objectives[0].sections = plans[0]!.slots.map(s => ({
+      slot_id: s.slot_id, used_fact_ids: s.fact_ids, heading: "端点辨析",
+      body: "上界不是实际取到的最后一个数。需要在遍历时检查结束位置。", steps: [], code: null,
+    }))
+    expect(materializeConceptSegmentV2(request, payload, plans).misconceptions[0]!.citations.map(c => c.fact_id)).toEqual(["F005"])
+    request.evidence_pack.results[0]!.misconceptions[0]!.factRefs.push({ sourceId: "K007", factId: "F999" })
+    expect(buildConceptSectionPlansForSegment(request)[0]!.slots.find(s => s.kind === "misconception")!.misconception_belief).toBeUndefined()
+  })
+  test("段落改写同目标其他事实时保留显式引用，拒绝越界引用", () => {
+    const request = segmentRequest(
+      [{ objective_id: "O1", source_id: "K007", fact_ids: ["F001", "F002"], behavior: "trace" }],
+      [
+        { source_id: "K007", fact_id: "F001", content: "for 可遍历序列中的元素。" },
+        { source_id: "K007", fact_id: "F002", content: "range 的 stop 不包含在结果中。" },
+      ],
+    )
+    const plans = buildConceptSectionPlansForSegment(request)
+    const payload = structuredClone(payloadV2) as any
+    payload.objectives[0].sections = plans[0]!.slots.map(slot => ({
+      slot_id: slot.slot_id, used_fact_ids: ["F002"], heading: "观察端点",
+      body: "上界设为五时，最后一次取得的是四。", steps: [], code: null,
+    }))
+    const materialized = materializeConceptSegmentV2(request, payload, plans)
+    const overview = materialized.explanation_blocks.find(block => block.block_type === "paragraph") as any
+    expect(overview.claims.flatMap((claim: any) => claim.citations).some((c: any) => c.fact_id === "F002")).toBe(true)
+    payload.objectives[0].sections[0].used_fact_ids = ["F999"]
+    expect(validateConceptSectionStructure({ plan: plans[0]!, authored: payload.objectives[0] }).join("\n")).toContain("目标之外")
+    expect(() => materializeConceptSegmentV2(request, payload, plans)).toThrow("FACT_OUT_OF_SCOPE")
+  })
   test("模型省略空 steps/code 时先规范化，不以 TypeError 中断候选修复", () => {
     const request = segmentRequest(
       [{ objective_id: "O1", source_id: "K001", fact_ids: ["F001"], behavior: "explain" }],
@@ -110,7 +197,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
       Array.isArray(section.steps) && section.code === null)).toBe(true)
   })
 
-  test("模型的一句长讲解和越界即时检查由事实物化层规范为可发布结构", () => {
+  test("规范讲解保留模型题目与答案，交由完整语义审核而不替换成事实背诵题", () => {
     const request = segmentRequest(
       [{ objective_id: "O1", source_id: "K002", fact_ids: ["F001", "F002"], behavior: "explain" }],
       [
@@ -143,18 +230,28 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
     const normalized = anchorConceptFactsInVisibleText({ payload, request, plans })
     expect(validateConceptSegmentV2AgainstPlans(normalized, plans).join("\n"))
       .not.toContain("至少需要")
-    expect(normalized.objectives[0]!.micro_check.answer).toContain("Python 使用 = 进行变量赋值")
-    expect(normalized.objectives[0]!.micro_check.prompt).toContain("理解变量")
-    expect(normalized.objectives[0]!.micro_check.options).toEqual([
-      "Python 使用 = 进行变量赋值。",
-      "Python 不使用 = 进行变量赋值。",
-    ])
-    expect(normalized.objectives[0]!.micro_check.options.join(" ")).not.toContain("变量名用于引用")
+    expect(normalized.objectives[0]!.micro_check).toEqual(payload.objectives[0].micro_check)
+    plans[0]!.micro_check.mode = "recognition"
     expect(validateConceptMicroCheckEvidenceDiscipline(
       normalized,
       plans,
       new Map([["O1", ["Python 使用 = 进行变量赋值。", "变量名用于引用程序中的数据。"]]]),
     )).toEqual([])
+  })
+
+  test("应用型即时检查保留可复算的推理答案，不要求答案逐字存在于事实中", () => {
+    const facts = [
+      { source_id: "K002", fact_id: "F001", content: "Python 使用 = 进行变量赋值。" },
+      { source_id: "K002", fact_id: "F002", content: "重新赋值时，新值会覆盖旧绑定。" },
+    ]
+    const request = segmentRequest([{ objective_id: "O1", source_id: "K002", fact_ids: ["F001", "F002"], behavior: "apply" }], facts)
+    const plans = buildConceptSectionPlansForSegment(request)
+    plans[0]!.micro_check = { mode: "guided_application", fact_ids: ["F001", "F002"], minimum_reasoning_steps: 2 }
+    const check = { prompt: "执行 x = 3，再执行 x = 7 后，x 对应什么值？", options: ["3", "7"], answer: "7", explanation: "先将 x 绑定到 3，再以 7 覆盖旧绑定，因此最后为 7。" }
+    const payload = { title: "赋值练习", objectives: [{ objective_id: "O1", sections: [], micro_check: check, hints: ["找先后顺序", "看最后绑定", "分两步跟踪"] }] }
+    const normalized = anchorConceptFactsInVisibleText({ payload, request, plans })
+    expect(normalized.objectives[0]!.micro_check).toEqual(check)
+    expect(validateConceptMicroCheckEvidenceDiscipline(normalized, plans, new Map([["O1", facts.map(f => f.content)]])).filter(x => x.includes("micro_check"))).toEqual([])
   })
 
   test("同一讲义中的重复代码示例会在作者阶段被拒绝", () => {
@@ -185,7 +282,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
     )
   })
 
-  test("讲义即时检查不能用未引用的绝对用途制造干扰项", () => {
+  test("干扰项交给语义辨析，指定正确项仍不能无依据绝对化", () => {
     const plan = {
       objective_id: "O1", mode: "definition_only", slots: [],
       micro_check: { mode: "recognition", fact_ids: ["F1"], minimum_reasoning_steps: 1 },
@@ -208,10 +305,12 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
       [plan],
       new Map([["O1", ["Python 是一种通用编程语言。"]]]),
     )
-    expect(issues.join("\n")).toContain("未授权的绝对限定：仅限")
+    expect(issues).toEqual([])
+    payload.objectives[0].micro_check.answer = "Python 仅限用于网页设计"
+    expect(validateConceptMicroCheckEvidenceDiscipline(payload, [plan], new Map([["O1", ["Python 是一种通用编程语言。"]]])).join("\n")).toContain("未授权的绝对限定：仅限")
   })
 
-  test("讲义即时检查不能用未引用的编译器机制制造干扰项", () => {
+  test("讲义即时检查的干扰项交给 choice_assessment 语义审核，不用字面相似度误判", () => {
     const plan = {
       objective_id: "O1", mode: "definition_only", slots: [],
       micro_check: { mode: "recognition", fact_ids: ["F1"], minimum_reasoning_steps: 1 },
@@ -234,10 +333,10 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
       [plan],
       new Map([["O1", ["Python 程序通常由解释器执行。"]]]),
     )
-    expect(issues.join("\n")).toContain("不是事实复述或直接否定")
+    expect(issues).toEqual([])
   })
 
-  test("普通讲解不能把解释器事实扩写成未引用的否定性机制", () => {
+  test("普通讲解不因出现否定连词直接失败，完整命题由语义审核判断", () => {
     const plan = {
       objective_id: "O1", mode: "definition_only",
       slots: [{ slot_id: "S1", kind: "fact_explanation" }],
@@ -260,7 +359,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
       [plan],
       new Map([["O1", ["Python 程序通常由解释器执行。"]]]),
     )
-    expect(issues.join("\n")).toContain("否定性机制说明：而不是")
+    expect(issues).toEqual([])
   })
 
   test("赋值事实允许用新变量名和值作直接实例，不误判为替代机制", () => {
@@ -297,7 +396,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
     expect(issues.join("\n")).not.toContain("具体替代说法")
   })
 
-  test("分步示例不能用未引用的编译器或大括号制造具体反例", () => {
+  test("分步示例的具体反例不由关键词门禁裁决，避免误杀上下文中的待辨析命题", () => {
     const plan = {
       objective_id: "O1", mode: "guided_explanation",
       slots: [{ slot_id: "S1", kind: "guided_example" }],
@@ -328,12 +427,10 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
       [plan],
       new Map([["O1", ["Python 程序通常由解释器执行。", "Python 用缩进表示代码块。"]]]),
     )
-    expect(issues.join("\n")).toContain("事实未提供的具体替代说法")
-    expect(issues.join("\n")).toContain("编译器直接转换为硬件指令")
-    expect(issues.join("\n")).toContain("大括号表示代码块")
+    expect(issues).toEqual([])
   })
 
-  test("误区不能用知识库未提供的具体领域缩小事实范围", () => {
+  test("误区假设与纠正作为语义单元审核，不按单个范围词直接拒绝", () => {
     const plan = {
       objective_id: "O1", mode: "definition_only",
       slots: [{ slot_id: "S1", kind: "misconception" }],
@@ -361,7 +458,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
       [plan],
       new Map([["O1", ["Python 是一种通用编程语言。"]]]),
     )
-    expect(issues.join("\n")).toContain("misconception S1 引入事实未授权的绝对限定：仅用于")
+    expect(issues).toEqual([])
   })
 
   test("buildConceptSectionPlansForSegment 为每个 objective 生成 section plan", () => {
@@ -651,7 +748,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
     expect(lesson.explanation_blocks.length).toBeGreaterThanOrEqual(2)
     expect(lesson.explanation_blocks[0]).toEqual(expect.objectContaining({
       block_type: "heading",
-      text: "x（O1）",
+      text: "x",
     }))
     expect(lesson.worked_examples.length).toBeGreaterThanOrEqual(1)
     expect(lesson.misconceptions.length).toBe(1)
@@ -729,7 +826,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
         }
         captured = stage
         const contract = (stage.input as {
-          staged_contract: { section_plan: Array<{ objective_id: string; slots: Array<{ slot_id: string; kind: string }> }> }
+          staged_contract: { section_plan: Array<{ objective_id: string; slots: Array<{ slot_id: string; kind: string; fact_ids: string[] }> }> }
         }).staged_contract.section_plan
         return {
           title: "Python 基本类型",
@@ -737,6 +834,7 @@ describe("改进方案5 审查修复：Section Plan V2 真实链路", () => {
             objective_id: objective.objective_id,
             sections: objective.slots.map((slot) => ({
               slot_id: slot.slot_id,
+              used_fact_ids: slot.fact_ids,
               heading: slot.kind,
               body: slot.kind === "misconception"
                 ? "错误理解是 int 不表示整数；这与当前事实冲突。正确理解是 int 表示整数，可回看关键词自查。"

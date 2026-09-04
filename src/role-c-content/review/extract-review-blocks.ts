@@ -3,6 +3,7 @@ import type {
   CodeLabPublicArtifact,
   ConceptLessonArtifact,
   RenderBlock,
+  QuizBlock,
 } from "../contracts/artifacts"
 import type { CitationRef } from "../contracts/common"
 import type {
@@ -54,7 +55,7 @@ export function extractConceptBlocks(artifact: ConceptLessonArtifact): ReviewCon
     ...payload.micro_checks.map((block) => makeBlock(
       "concept",
       { field: "quiz", ref_id: block.item_id, parent_block_id: block.block_id, objective_id: objectiveByBlock.get(block.block_id) },
-      promptWithOptions(block.prompt, block.options),
+      quizWithFeedback(block),
       block.citations,
       "citation_only",
       block.options?.length ? "choice_assessment" : "open_assessment",
@@ -142,16 +143,34 @@ export function extractCodeLabBlocks(artifact: CodeLabPublicArtifact): ReviewCon
       "citation_only",
       "starter_skeleton",
     ),
-    ...payload.reflection_questions.map((question, index) => makeBlock(
-      "code_lab",
-      { field: "reflection", ref_id: `${payload.lab_id}:${index + 1}` },
-      question,
-      payload.used_evidence,
-      "citation_only",
-      "normative_task",
-    )),
+    ...payload.reflection_questions.map((question, index) => ({
+      ...makeBlock(
+        "code_lab",
+        { field: "reflection", ref_id: `${payload.lab_id}:${index + 1}` },
+        question,
+        payload.used_evidence,
+        "citation_only",
+        "normative_task",
+      ),
+      task_context: codeLabReflectionTaskContext(payload),
+    })),
     ...guideBlocks,
   ]
+}
+
+function codeLabReflectionTaskContext(payload: NonNullable<CodeLabPublicArtifact["payload"]>): string {
+  return [
+    "已发布执行合同：",
+    JSON.stringify(payload.execution_contract),
+    "已发布 starter_code：",
+    payload.starter_code,
+    "已发布公开样例：",
+    ...payload.public_tests.map((test, index) => [
+      `样例 ${index + 1}：${test.description}`,
+      `输入：${JSON.stringify(test.input)}`,
+      `预期行为：${test.expected_behavior}`,
+    ].join("\n")),
+  ].join("\n")
 }
 
 export function extractAssessmentBlocks(artifact: AssessmentPublicArtifact): ReviewContentBlock[] {
@@ -234,7 +253,7 @@ function reviewRenderBlock(
     return [makeBlock(
       kind,
       { field: "quiz", ref_id: block.item_id, parent_block_id: block.block_id, objective_id: objectiveId },
-      promptWithOptions(block.prompt, block.options),
+      quizWithFeedback(block),
       block.citations,
       "citation_only",
       block.options?.length ? "choice_assessment" : "open_assessment",
@@ -251,6 +270,15 @@ function reviewRenderBlock(
     )]
   }
   return []
+}
+
+function quizWithFeedback(block: QuizBlock): string {
+  const answer = block.options?.find((option) => option.option_id === block.answer_option_id)
+  return [
+    promptWithOptions(block.prompt, block.options),
+    answer ? `即时反馈指定答案：${answer.label}：${answer.text}` : "",
+    block.answer_explanation ? `即时反馈解释：${block.answer_explanation}` : "",
+  ].filter(Boolean).join("\n")
 }
 
 function renderedBlockText(block: RenderBlock): string | undefined {

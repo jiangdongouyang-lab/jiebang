@@ -1,4 +1,6 @@
-# 正式评测方法
+# 正式评测方法（历史 V1）
+
+本文件记录早期 60×2 方案，保留用于追溯，不再作为比赛最终执行入口。当前冻结合同、60×1 放量顺序、同模型独立调用标识、断点恢复和正式命令统一见 [`docs/evaluation-v3/RUNBOOK.md`](../docs/evaluation-v3/RUNBOOK.md)。执行时以 V3 文档和 `evaluation/v2/frozen.json` 为准。
 
 ## 评测对象
 
@@ -56,11 +58,11 @@
 ## 运行命令
 
 ```bash
-# 12 例开发检查
-bun run eval:competition:dev
+# 历史 12 例开发检查（仅用于追溯 V1）
+bun run eval:competition:legacy:dev
 
-# 60 例 × 2 次正式评测
-bun run eval:competition:final
+# 历史 60 例 × 2 次评测（不作为当前正式结果）
+bun run eval:competition:legacy:final
 
 # 12 例辅助鲁棒性检查
 bun run eval:competition:robustness
